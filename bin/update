@@ -1,0 +1,8 @@
+#!/bin/bash 
+: <<DOCXX
+Add description
+Author
+DATE: 
+DOCXX
+git fetch -p
+git status
