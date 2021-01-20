@@ -1,0 +1,5 @@
+= morganize
+
+Generate this with
+    morganize _doc
+After you have described your command line interface

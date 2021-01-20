@@ -1,0 +1,95 @@
+#!/usr/bin/env ruby
+require 'gli'
+
+module Morganize
+  class Init
+
+    def check
+      true
+    end
+  
+    def make_dirs
+      true
+    end
+  
+    def git_repos
+      [1,2,3]
+    end
+  
+    def list_repos
+      git_repos.each { |r| puts r }
+    end
+  
+    def clone_repos
+      git_repos.each do |r|
+        true
+      end
+    end
+
+
+  end
+end
+
+class App
+  extend GLI::App
+
+  program_desc 'Bootstrap any Mac with my stuff, also provide uninstall'
+
+  version Morganize::VERSION
+
+  subcommand_option_handling :normal
+  arguments :strict
+
+  desc 'Run in "debug" mode'
+  switch [:d,:debug]
+
+  desc 'Say "Yes" to all prompts'
+  switch [:y,:yes]
+
+  arg 'filename'
+  flag [:f,:config_file,'file-name'], :desc => 'Use this config file'
+
+  desc '"List" the things you can do'
+  arg_name 'Show all the things that can be installed or altered without changing anything'
+  command :list do |c|
+    c.action do |global_options,options,args|
+      puts "install command ran #{c.inspect}"
+    end
+  end
+
+  desc '"Install" my stuff, pull from github, create aliases'
+  arg_name 'morganize install [*all*|minimal]'
+  command :install do |c|
+    c.action do |global_options,options,args|
+      i = Morganize::Init.new
+      i.check
+      i.make_dirs
+      i.list_repos
+      puts "install command ran"
+    end
+  end
+
+
+  pre do |global,command,options,args|
+    # Pre logic here
+    # Return true to proceed; false to abort and not call the
+    # chosen command
+    # Use skips_pre before a command to skip this block
+    # on that command only
+    true
+  end
+
+  post do |global,command,options,args|
+    # Post logic here
+    # Use skips_post before a command to skip this
+    # block on that command only
+  end
+
+  on_error do |exception|
+    # Error logic here
+    # return false to skip default error handling
+    true
+  end
+end
+
+exit App.run(ARGV)

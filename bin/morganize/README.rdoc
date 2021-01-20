@@ -1,0 +1,6 @@
+= morganize
+
+Describe your project here
+
+:include:morganize.rdoc
+

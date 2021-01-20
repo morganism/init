@@ -1,0 +1,56 @@
+#!/bin/bash 
+: <<WHAT_AM_I
+Setup my stuff
+Author: morgan.sziraki@gmail.com   
+DATE: Wed 26 Aug 2020 18:30:37 BST
+WHAT_AM_I
+
+verbose=false
+debug=false
+
+# Parse options to the `setup` command
+while getopts ":h" opt; do
+  case ${opt} in
+    h )
+      echo "Usage:"
+      echo "    setup -h                      Display this help message."
+      echo "    setup install <package>       Install <package>."
+      exit 0
+      ;;
+   \? )
+     echo "Invalid Option: -$OPTARG" 1>&2
+     exit 1
+     ;;
+  esac
+done
+shift $((OPTIND -1))
+
+subcommand=$1; shift  # Remove 'setup' from the argument list
+echo "sub${subcommand}"
+case "$subcommand" in
+  # Parse options to the install sub command
+  install)
+echo "sub${subcommand}"
+    package=$1; shift  # Remove 'install' from the argument list
+
+    # Process package options
+    while getopts ":t" opt; do
+        echo "OPT${opt}"
+      case ${opt} in
+        t )
+          target=$OPTARG
+          echo "x"
+          ;;
+        \? )
+          echo "Invalid Option: -$OPTARG" 1>&2
+          exit 1
+          ;;
+        : )
+          echo "Invalid Option: -$OPTARG requires an argument" 1>&2
+          exit 1
+          ;;
+      esac
+    done
+    shift $((OPTIND -1))
+    ;;
+esac
