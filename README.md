@@ -1,6 +1,7 @@
 # init
 Initialiser
 ddd
+add
 
 
 ![CI](https://github.com/morganism/init/workflows/CI/badge.svg)
