@@ -1,0 +1,7 @@
+{
+  "repos": [
+    "init",
+    "osx-utils",
+    "nix-kit"
+  ]
+}
