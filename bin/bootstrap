@@ -1,0 +1,8 @@
+#!/bin/bash 
+: <<__DOCS__
+DESCRIPTION: initial setup script
+AUTHOR:      morgan.sziraki@gmail.com
+DATE:        Tue 27 Apr 2021 00:37:59 BST
+__DOCS__
+
+
