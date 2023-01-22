@@ -28,6 +28,7 @@ jobs:
       with:
         ruby-version: 2.6
         bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+    - run: gem update --system 3.2.3
     - run: bundle exec rake        
 #    - name: Install dependencies
 #      run: bundle install
