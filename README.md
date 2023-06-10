@@ -1,7 +1,7 @@
 # init
 Initialiser
-ddd
-add
+
+<a href="/" download="init.sh">Get</a>
 
 
 ![CI](https://github.com/morganism/init/workflows/CI/badge.svg)
