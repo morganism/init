@@ -1,0 +1,10 @@
+# these are helper functions for the init repo
+
+is_apple() {
+  UNAME=$(uname -a)
+  if [[ $UNAME =~ ^Darwin ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
