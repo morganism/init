@@ -1,0 +1,10 @@
+
+list_tokens() {
+	if [ -d ~/tokens ]; then
+		TOKENS="$(find ~/tokens -type f)"
+		if [ -n "$TOKENS" ]; then
+			echo "The following tokens exist:"
+			echo "${TOKENS}"
+		fi
+	fi
+}

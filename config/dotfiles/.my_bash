@@ -1,0 +1,29 @@
+# my bash customisation for linux
+
+set -o vi
+
+eval "$(rbenv init -)"
+
+if [ -f ~/.aliases ]; then
+    . ~/.aliases
+fi
+
+# token handling
+if [ -d ~/tokens ]; then
+  TOKENS="$(find ~/tokens -type f)"
+  if [ -n "$TOKENS" ]; then
+    echo "The following tokens exist:"
+    echo "${TOKENS}"
+
+    for t in $TOKENS 
+    do
+      TOKEN_KEY="$(basename $t)"
+      TOKEN_VAL="$(cat $t)"
+      FIRST3=${TOKEN_VAL:0:3}
+      LAST3=${TOKEN_VAL: -3}
+      eval 'export $TOKEN_KEY=$TOKEN_VAL'
+      echo "exported $TOKEN_KEY=$FIRST3******$LAST3"
+    done
+  fi
+fi
+
