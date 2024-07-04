@@ -1,4 +1,24 @@
 # these are helper functions for the init repo
+# this file should be in the bin directory or it will announce it is in the wrong place
+
+validate_dot_functions_location() {
+  shopt -s extdebug; TD=$(declare -Ff validate_dot_functions_location|awk '{print $3}'); shopt -u extdebug
+  THIS_DIR=$(dirname $( realpath $TD))
+  if [[ $THIS_DIR =~ bin$ ]]; then
+    return 0
+  else
+    echo "Whoa! I'm in the wrong spot [$THIS_DIR] .. I should be in a 'bin' dir in the repo root directory!" 
+    echo "Fix ME!"
+    return 99
+  fi
+}
+validate_dot_functions_location # this will error if not in a bin dir, could trick it by putting in ~/bin :-)
+
+source_dir() {
+  SRCDIR="$(realpath ..)"
+  cat ../.git/config | grep url | sed -e 's:^.*/::' -e 's:.git::'
+  echo "Source Directory is: $SRCDIR"
+}
 
 is_apple() {
   UNAME=$(uname -a)
