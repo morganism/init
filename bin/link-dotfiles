@@ -1,0 +1,22 @@
+#!/bin/bash
+
+pushd ~ 2>&1 > /dev/null
+DOTFILES="$(find $SRCDIR/config/dotfiles -type f -name '.*')"
+
+echo -e "Linking these DOTFILES:\n$DOTFILES"
+for df in $DOTFILES
+do
+  ln -s $df .
+done
+
+if [ $(grep -c my_bash ~/.bashrc) == "0" ]; then
+
+cat << __END__ >> ~/.bashrc
+if [ -f ~/.my_bash ]; then
+    . ~/.my_bash
+fi
+__END__
+
+fi
+
+popd
