@@ -11,4 +11,9 @@ Initialise access to github, provide tooling and helpers to maintain source cont
 This repo provides several utilities, apps, scripts, aliases and a baseline configuration 
 
 
+``` git clone --recurse-submodules -j8 git@github.com:morganism/init.git ```
+
+
+
+
 
