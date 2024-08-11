@@ -1,2 +1,2 @@
 #!/bin/bash
-echo works
+git clone --recurse-submodules -j8 git@github.com:morganism/init.git
