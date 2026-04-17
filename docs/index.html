@@ -1,7 +1,46 @@
-<htnl>
-  <head></head>
-  <body>
-    <h1>init</h1>
-    <h2>hello</h2>
-  </body>
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>morganism bootstrap</title>
+  <style>
+    body { background:#111; color:#ccc; font-family:monospace;
+           display:flex; align-items:center; justify-content:center;
+           height:100vh; margin:0; }
+    .box { text-align:center; }
+    pre  { color:#0f0; margin-bottom:2rem; }
+    button { background:none; border:1px solid #0f0; color:#0f0;
+             font-family:monospace; font-size:1rem;
+             padding:.5rem 2rem; cursor:pointer; margin:0 .5rem; }
+    button:hover { background:#0f0; color:#111; }
+    #msg { margin-top:1rem; color:#ff0; }
+  </style>
+</head>
+<body>
+<div class="box">
+  <pre>
+👢 morganism bootstrap
+ ───────────────────
+ dotfiles + tooling + environment
+  </pre>
+  <p>Proceed with Bootstrap?</p>
+  <button onclick="go()">Y</button>
+  <button onclick="bail()">N</button>
+  <div id="msg"></div>
+</div>
+
+<script>
+function go() {
+  const a    = document.createElement('a');
+  a.href     = 'bootstrap.sh';          // same-origin: works
+  a.download = 'bootstrap.sh';
+  a.click();
+  document.getElementById('msg').textContent =
+    '↓ downloading... run: bash bootstrap.sh';
+}
+function bail() {
+  document.getElementById('msg').textContent = 'aborted.';
+}
+</script>
+</body>
 </html>
