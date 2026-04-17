@@ -1,46 +1,280 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>morganism bootstrap</title>
-  <style>
-    body { background:#111; color:#ccc; font-family:monospace;
-           display:flex; align-items:center; justify-content:center;
-           height:100vh; margin:0; }
-    .box { text-align:center; }
-    pre  { color:#0f0; margin-bottom:2rem; }
-    button { background:none; border:1px solid #0f0; color:#0f0;
-             font-family:monospace; font-size:1rem;
-             padding:.5rem 2rem; cursor:pointer; margin:0 .5rem; }
-    button:hover { background:#0f0; color:#111; }
-    #msg { margin-top:1rem; color:#ff0; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>morganism bootstrap</title>
+<style>
+  :root {
+    --bg:      #0d0d0d;
+    --surface: #161616;
+    --border:  #2a2a2a;
+    --green:   #00e676;
+    --green-d: #00c853;
+    --muted:   #555;
+    --text:    #ccc;
+    --dim:     #888;
+    --red:     #ff5252;
+    --amber:   #ffab40;
+    --mono:    'Courier New', Courier, monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .terminal {
+    width: min(680px, 94vw);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .titlebar {
+    background: #1e1e1e;
+    border-bottom: 1px solid var(--border);
+    padding: 10px 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .dot-r { background: #ff5f57; }
+  .dot-y { background: #ffbd2e; }
+  .dot-g { background: #28c840; }
+  .titlebar-label {
+    margin-left: auto;
+    margin-right: auto;
+    font-size: 12px;
+    color: var(--muted);
+    letter-spacing: 0.05em;
+  }
+  .body { padding: 2rem 2rem 2.5rem; }
+  .ascii {
+    color: var(--green);
+    font-size: 11px;
+    line-height: 1.3;
+    white-space: pre;
+    margin-bottom: 2rem;
+    opacity: 0.85;
+  }
+  .section { margin-bottom: 1.5rem; }
+  .label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 0.5rem;
+  }
+  .cmd-block {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    cursor: pointer;
+    transition: border-color 0.15s;
+    position: relative;
+  }
+  .cmd-block:hover { border-color: var(--green); }
+  .prompt { color: var(--green); user-select: none; flex-shrink: 0; }
+  .cmd-text {
+    color: var(--amber);
+    font-size: 13px;
+    flex: 1;
+    word-break: break-all;
+  }
+  .copy-icon {
+    flex-shrink: 0;
+    font-size: 14px;
+    color: var(--muted);
+    transition: color 0.15s;
+  }
+  .cmd-block:hover .copy-icon { color: var(--green); }
+  .status {
+    font-size: 12px;
+    margin-top: 0.6rem;
+    min-height: 1.2em;
+    transition: color 0.3s;
+  }
+  .status.ok     { color: var(--green); }
+  .status.error  { color: var(--red); }
+  .status.notice { color: var(--dim); }
+  .divider {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 1.5rem 0;
+  }
+  .btn-row {
+    display: flex;
+    gap: 0.75rem;
+    margin-top: 0.5rem;
+  }
+  .btn {
+    flex: 1;
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 0.6rem 1rem;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .btn-yes { border-color: var(--green); color: var(--green); }
+  .btn-yes:hover { background: var(--green); color: var(--bg); }
+  .btn-no:hover  { background: var(--border); }
+  .dl-status {
+    font-size: 12px;
+    margin-top: 0.6rem;
+    min-height: 1.2em;
+    color: var(--dim);
+  }
+  .meta {
+    margin-top: 2rem;
+    font-size: 11px;
+    color: var(--muted);
+    border-top: 1px solid var(--border);
+    padding-top: 1rem;
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+  .meta a { color: var(--dim); text-decoration: none; }
+  .meta a:hover { color: var(--green); }
+</style>
 </head>
 <body>
-<div class="box">
-  <pre>
-👢 morganism bootstrap
- ───────────────────
- dotfiles + tooling + environment
-  </pre>
-  <p>Proceed with Bootstrap?</p>
-  <button onclick="go()">Y</button>
-  <button onclick="bail()">N</button>
-  <div id="msg"></div>
+<div class="terminal">
+  <div class="titlebar">
+    <span class="dot dot-r"></span>
+    <span class="dot dot-y"></span>
+    <span class="dot dot-g"></span>
+    <span class="titlebar-label">morganism — bootstrap</span>
+  </div>
+  <div class="body">
+
+    <pre class="ascii"> _ __ ___   ___  _ __ __ _  __ _ _ __ (_)___ _ __ ___
+| '_ ` _ \ / _ \| '__/ _` |/ _` | '_ \| / __| '_ ` _ \
+| | | | | | (_) | | | (_| | (_| | | | | \__ \ | | | | |
+|_| |_| |_|\___/|_|  \__, |\__,_|_| |_|_|___/_| |_| |_|
+                      |___/  dotfiles + tooling + env</pre>
+
+    <div class="section">
+      <div class="label">one-liner bootstrap</div>
+      <div class="cmd-block" id="cmd-block" onclick="copyCmd()">
+        <span class="prompt">$</span>
+        <span class="cmd-text" id="cmd-text">curl -fsSL https://morganism.github.io/bootstrap.sh | bash</span>
+        <span class="copy-icon" id="copy-icon">&#9112;</span>
+      </div>
+      <div class="status notice" id="copy-status">click to copy</div>
+    </div>
+
+    <hr class="divider">
+
+    <div class="section">
+      <div class="label">download bootstrap.sh</div>
+      <div class="btn-row">
+        <button class="btn btn-yes" onclick="doDownload()">[ Y ] proceed</button>
+        <button class="btn btn-no"  onclick="doBail()">[ N ] cancel</button>
+      </div>
+      <div class="dl-status" id="dl-status">&nbsp;</div>
+    </div>
+
+    <div class="meta">
+      <span>sha256: <span id="sha">—</span></span>
+      <span><a href="https://github.com/morganism" target="_blank">github.com/morganism</a></span>
+    </div>
+
+  </div>
 </div>
 
 <script>
-function go() {
-  const a    = document.createElement('a');
-  a.href     = 'bootstrap.sh';          // same-origin: works
+const CMD = 'curl -fsSL https://morganism.github.io/bootstrap.sh | bash';
+
+async function copyCmd() {
+  const status = document.getElementById('copy-status');
+  const icon   = document.getElementById('copy-icon');
+  try {
+    await navigator.clipboard.writeText(CMD);
+    status.textContent = '✓ copied to clipboard';
+    status.className = 'status ok';
+    icon.textContent = '✓';
+    setTimeout(() => {
+      status.textContent = 'click to copy';
+      status.className = 'status notice';
+      icon.innerHTML = '&#9112;';
+    }, 2500);
+  } catch (e) {
+    fallbackCopy();
+  }
+}
+
+function fallbackCopy() {
+  const ta = document.createElement('textarea');
+  ta.value = CMD;
+  ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+  document.body.appendChild(ta);
+  ta.select();
+  const ok = document.execCommand('copy');
+  document.body.removeChild(ta);
+  const status = document.getElementById('copy-status');
+  const icon   = document.getElementById('copy-icon');
+  if (ok) {
+    status.textContent = '✓ copied to clipboard';
+    status.className = 'status ok';
+    icon.textContent = '✓';
+    setTimeout(() => {
+      status.textContent = 'click to copy';
+      status.className = 'status notice';
+      icon.innerHTML = '&#9112;';
+    }, 2500);
+  } else {
+    status.textContent = 'select and copy manually';
+    status.className = 'status error';
+  }
+}
+
+function doDownload() {
+  const a = document.createElement('a');
+  a.href = 'bootstrap.sh';
   a.download = 'bootstrap.sh';
   a.click();
-  document.getElementById('msg').textContent =
-    '↓ downloading... run: bash bootstrap.sh';
+  document.getElementById('dl-status').textContent =
+    '↓ downloading bootstrap.sh ...';
 }
-function bail() {
-  document.getElementById('msg').textContent = 'aborted.';
+
+function doBail() {
+  document.getElementById('dl-status').textContent = 'cancelled.';
 }
+
+// ── onload: attempt silent auto-copy ─────────────────────────────────────────
+// Clipboard write requires user gesture in modern browsers.
+// Silent attempt — no error shown on fail (user sees "click to copy" anyway).
+window.addEventListener('load', () => {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(CMD).then(() => {
+      const s = document.getElementById('copy-status');
+      s.textContent = '✓ auto-copied to clipboard';
+      s.className = 'status ok';
+      setTimeout(() => {
+        s.textContent = 'click to copy again';
+        s.className = 'status notice';
+      }, 3000);
+    }).catch(() => {
+      // silently ignored — user sees "click to copy"
+    });
+  }
+});
 </script>
 </body>
 </html>
