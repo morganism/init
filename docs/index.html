@@ -173,7 +173,7 @@
       <div class="label">one-liner bootstrap</div>
       <div class="cmd-block" id="cmd-block" onclick="copyCmd()">
         <span class="prompt">$</span>
-        <span class="cmd-text" id="cmd-text">curl -fsSL https://raw.githubusercontent.com/morganism/init/refs/heads/master/bootstrap.sh | bash</span>
+        <span class="cmd-text" id="cmd-text"> curl -fsSL https://raw.githubusercontent.com/morganism/init/refs/heads/master/bootstrap.sh| bash</span>
         <span class="copy-icon" id="copy-icon">&#9112;</span>
       </div>
       <div class="status notice" id="copy-status">click to copy</div>
@@ -199,7 +199,7 @@
 </div>
 
 <script>
-const CMD = 'curl -fsSL https://morganism.github.io/bootstrap.sh | bash';
+const CMD = 'curl -fsSL https://raw.githubusercontent.com/morganism/init/refs/heads/master/bootstrap.sh | bash';
 
 async function copyCmd() {
   const status = document.getElementById('copy-status');
