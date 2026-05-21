@@ -1,0 +1,10 @@
+window.onload = () => {
+  setTimeout(() => {
+    // setTimeout pushes it out of page load context
+    // works in some older browsers / Electron
+    const a    = document.createElement('a');
+    a.href     = URL.createObjectURL(blob);
+    a.download = 'file.txt';
+    a.click();
+  }, 100);
+};
