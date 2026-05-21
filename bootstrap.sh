@@ -20,6 +20,17 @@ organise queued tasks, determine current state, etc ... )
 
 That is the ideal tool. Simplify.
 	
+
+you can see why state machine is needed, when i re-call bootstrap.sh it needs to 
+be able to "take over" from the calling bootstrap.
+determine if git repo checked out or not yet
+make temp dir and cd
+curl -L https://github.com/morganism/init/archive/refs/tags/latest.tar.gz | tar -xz
+cd init-latest
+call real bootstrap.sh
+
+
+
 DOCXX
 
 
