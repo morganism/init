@@ -1,7 +1,0 @@
-# Sinatra — fits your DotForge daemon pattern
-get '/bootstrap' do
-  send_file 'bootstrap.run',
-    type:        'application/octet-stream',
-    disposition: 'attachment',
-    filename:    'bootstrap.run'
-end
