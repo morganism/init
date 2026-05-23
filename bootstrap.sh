@@ -99,9 +99,11 @@ box() {
 
   printf "${col}╔${bar}╗${R}\n" > /dev/tty
 
-  # Title line — plain text, standard %-*s padding
-  printf "${col}║${R} ${BOLD}${col}%-*s${R} ${col}║${R}\n" \
-    "$((W - 2))" "  ${title}" > /dev/tty
+  # Title line — use _rpad so ANSI codes in title don't skew field width.
+  # Inner cell is W chars wide; _rpad fills to W-2 then we add one space
+  # on each side (the leading space is baked into the _rpad call).
+  local title_padded; title_padded="$(_rpad " ${BOLD}${col} ${title}${R}" "$((W - 1))")"
+  printf "${col}║${R}%s ${col}║${R}\n" "$title_padded" > /dev/tty
 
   printf "${col}╠${bar}╣${R}\n" > /dev/tty
 
@@ -380,6 +382,18 @@ fi
 log "zenity path: $(command -v zenity)"
 
 ansi_bar "System ready:"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISPLAY CHECK — Zenity requires a running graphical session.
+# Without $DISPLAY (X11) or $WAYLAND_DISPLAY the process blocks forever.
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+  printf "\n  ${RED}${BOLD}✘  No graphical display detected.${R}\n" > /dev/tty
+  printf "  ${DIM}Set DISPLAY (X11) or WAYLAND_DISPLAY before running,\n" > /dev/tty
+  printf "  or run inside a desktop session (not a plain SSH shell).${R}\n\n" > /dev/tty
+  log_error "No DISPLAY or WAYLAND_DISPLAY — cannot open Zenity dialogs"
+  exit 1
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — BASE_PATH (Zenity input dialog)
