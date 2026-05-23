@@ -383,10 +383,10 @@ zn_checklist() {
 }
 
 zn_msg() {
-  zenity --title "$1" --info --text "$2" --width 500 2>/dev/null || true
+  zenity --title "$1" --info --text "$2" 2>/dev/null || true
 }
 zn_error() {
-  zenity --title "✘  $1" --error --text "$2" --width 500 2>/dev/null || true
+  zenity --title "✘  $1" --error --text "$2" 2>/dev/null || true
 }
 
 # Zenity progress — driven via a background process reading from fd 9 (same
@@ -733,6 +733,16 @@ fi
 log "${DIALOG_BACKEND} path: $(command -v "$DIALOG_BACKEND")"
 
 ansi_bar "System ready:"
+
+# Redirect the script's stderr to the log file from this point forward.
+# All GTK/GLib diagnostic noise from zenity (GLib-CRITICAL, Gtk-WARNING, etc.)
+# is written to stderr by the GTK runtime before our per-command 2>/dev/null
+# redirects can take effect — they fire during GTK initialisation, inside the
+# process, before any file-descriptor manipulation the shell applies.
+# exec 2>> captures everything at the shell level, so no GLib/Adw chatter
+# can ever reach the terminal regardless of how or when zenity emits it.
+# The log file already exists (touch "$LOG" at script start), so appending is safe.
+exec 2>>"$LOG"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 5 — BASE_PATH (dialog input)
