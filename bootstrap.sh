@@ -4,13 +4,19 @@ bootstrap.sh — morganism init bootstrap
 ════════════════════════════════════════════════════════════════
 Bootstraps a new machine by:
   • Detecting OS and selecting the right package manager
-  • Installing whiptail (TUI ncurses dialog) + dependencies
-  • Prompting (via whiptail) for a base path and repo selection
+  • Auto-detecting display availability and offering a UI backend choice
+  • Installing the chosen dialog backend (whiptail or Zenity) + dependencies
+  • Prompting for a base path and repo selection via the chosen backend
   • Cloning selected morganism GitHub repositories
-  • Optionally removing whiptail after completion
+  • Optionally removing the dialog backend after completion
   • Logging every action, prompt answer, package and file path
 
-No DISPLAY/Wayland required — whiptail uses /dev/tty directly.
+UI backend selection (Step 2):
+  • DISPLAY or WAYLAND_DISPLAY set  → offer Zenity (GTK) or whiptail (ncurses)
+    — 5-second timed default: whiptail
+  • Neither display variable set     → whiptail only (no choice needed)
+  whiptail works everywhere (SSH, curl|bash, headless).
+  Zenity requires a running graphical session.
 
 Usage:
   curl -fsSL https://raw.githubusercontent.com/morganism/init/refs/heads/master/bootstrap.sh | bash
@@ -31,8 +37,14 @@ readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 readonly LOG="/tmp/bootstrap_${TIMESTAMP}.log"
 readonly REPOS_URL="https://raw.githubusercontent.com/morganism/init/refs/heads/master/bootstrap.repos"
 readonly DEFAULT_BASE_PATH="${HOME}/src/morganism"
-CLEANUP_WHIPTAIL=false
-WHIPTAIL_WAS_PREINSTALLED=false
+
+# UI backend — set in Step 2; one of: "whiptail" | "zenity"
+DIALOG_BACKEND="whiptail"
+
+# Per-backend install-tracking (separate because only the one we installed gets removed)
+CLEANUP_DIALOG=false          # should we remove the backend when done?
+DIALOG_WAS_PREINSTALLED=false # was it already present before we started?
+
 BASE_PATH=""
 declare -a SELECTED_REPOS=()
 declare -a CLONED_REPOS=()
@@ -237,28 +249,19 @@ ansi_bar() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WHIPTAIL WRAPPERS
+# ── WHIPTAIL WRAPPERS ────────────────────────────────────────────────────────
 #
 # whiptail (newt) reads/writes /dev/tty directly — no DISPLAY needed.
 #
-# ── Colour theming ────────────────────────────────────────────────────────────
-# NEWT_COLORS controls every palette element.  Without it, macOS's brew newt
-# renders the inputbox text area with a bright-green background (unreadable).
-# We set a clean dark theme matching the script's ANSI palette.
+# Colour theming via NEWT_COLORS — without it macOS brew newt renders the
+# inputbox with an unreadable bright-green background.
 #
-# ── Output capture without fd-swap ───────────────────────────────────────────
-# The classic "3>&1 1>&2 2>&3" fd-swap trick breaks inside $() subshells on
-# macOS: whiptail opens /dev/tty for its UI but the subshell's stdout is a
-# pipe, so the swap misdirects the UI draw — whiptail gets no keypresses,
-# immediately returns cancel (rc=1), and the calling $() captures nothing.
-#
-# Fix: write the result to a private temp file, run whiptail directly (not in
-# a subshell), read the temp file afterward.  The temp file is created in _wt()
-# and cleaned up by each wrapper after reading.
+# Output capture: the classic fd-swap (3>&1 1>&2 2>&3) breaks inside $()
+# subshells on macOS because the subshell's stdout is a pipe, misdirecting
+# whiptail's UI draw.  We write the result to a temp file instead and set
+# _WT_RESULT, which callers read directly without any subshell.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Shared dark theme — matches the ANSI cyan/blue/green palette of this script.
-# Format: element=foreground,background  (newt colour names)
 export NEWT_COLORS='
 root=white,black
 border=cyan,black
@@ -286,98 +289,164 @@ fullscale=black,cyan
 disabledentry=white,black
 '
 
-# Temp file for capturing whiptail output (avoids the $() subshell fd problem)
 _WT_TMP=""
-
-# _wt_open — create the temp file; called at the top of every dialog wrapper
+_WT_RESULT=""
 _wt_open()  { _WT_TMP="$(mktemp /tmp/_wt_out_XXXXXX)"; }
-
-# _wt_read — read the temp file content to stdout, then delete it
 _wt_read()  { cat "$_WT_TMP"; rm -f "$_WT_TMP"; _WT_TMP=""; }
-
-# _wt_clean — delete temp file without reading (used on cancel paths)
 _wt_clean() { rm -f "$_WT_TMP"; _WT_TMP=""; }
 
-# wt_input <title> <prompt> <default>
-# Sets _WT_RESULT and returns 0 (Ok) or 1 (Cancel).
-# Caller reads result from _WT_RESULT, not stdout, to avoid any subshell.
-_WT_RESULT=""
+# wt_input <title> <prompt> <default> → _WT_RESULT; rc 0=Ok 1=Cancel
 wt_input() {
   _wt_open
-  whiptail --title "$1" \
-           --inputbox "$2" \
-           12 72 "$3" \
+  whiptail --title "$1" --inputbox "$2" 12 72 "$3" \
            2>"$_WT_TMP" </dev/tty >/dev/tty
-  local rc=$?
-  _WT_RESULT="$(_wt_read)"
-  return $rc
+  local rc=$?; _WT_RESULT="$(_wt_read)"; return $rc
 }
 
-# wt_checklist <title> <prompt> <tag> <desc> <status> [...]
-# Sets _WT_RESULT; returns 0 (Ok) or 1 (Cancel).
+# wt_checklist <title> <prompt> <tag> <desc> <ON|OFF> [...] → _WT_RESULT
 wt_checklist() {
   local title="$1" prompt="$2"; shift 2
-  local n_items=$(( $# / 3 ))
-  local height=$(( n_items + 10 ))
-  [[ $height -gt 35 ]] && height=35
+  local n=$(( $# / 3 ))
+  local h=$(( n + 10 )); [[ $h -gt 35 ]] && h=35
   _wt_open
-  whiptail --title "$title" \
-           --checklist "$prompt" \
-           "$height" 72 "$n_items" \
-           "$@" \
+  whiptail --title "$title" --checklist "$prompt" "$h" 72 "$n" "$@" \
            2>"$_WT_TMP" </dev/tty >/dev/tty
-  local rc=$?
-  _WT_RESULT="$(_wt_read)"
-  return $rc
+  local rc=$?; _WT_RESULT="$(_wt_read)"; return $rc
 }
 
-# wt_msg <title> <text>  — OK-dismissable message box (no result value)
-wt_msg() {
-  whiptail --title "$1" --msgbox "$2" 20 72 </dev/tty >/dev/tty
-}
+wt_msg()   { whiptail --title "$1" --msgbox    "$2" 20 72 </dev/tty >/dev/tty; }
+wt_error() { whiptail --title "✘  $1" --msgbox "$2" 12 72 </dev/tty >/dev/tty; }
 
-# wt_error <title> <text>  — error message box
-wt_error() {
-  whiptail --title "✘  $1" --msgbox "$2" 12 72 </dev/tty >/dev/tty
-}
-
-# ── gauge (progress bar) ─────────────────────────────────────────────────────
-# whiptail --gauge reads lines from stdin:
-#   • A bare integer  →  set percentage
-#   • XXX / pct / label / XXX  →  update both percentage and label text
-#
-# We open a named FIFO and keep it alive on fd 9 so the gauge stays open
-# while we do real work, then close fd 9 to signal completion.
-# ─────────────────────────────────────────────────────────────────────────────
-GAUGE_PID=""
-_GAUGE_FIFO=""
+# whiptail gauge — driven via a named FIFO kept open on fd 9
+GAUGE_PID=""; _GAUGE_FIFO=""
 
 wt_gauge_start() {
-  local title="$1" init_text="$2"
   _GAUGE_FIFO="$(mktemp -u /tmp/_wt_gauge_XXXXXX)"
   mkfifo "$_GAUGE_FIFO"
-  whiptail --title "$title" \
-           --gauge "$init_text" \
-           8 72 0 < "$_GAUGE_FIFO" &
+  whiptail --title "$1" --gauge "$2" 8 72 0 < "$_GAUGE_FIFO" &
   GAUGE_PID=$!
-  exec 9>"$_GAUGE_FIFO"   # keep the write end open so whiptail doesn't see EOF
+  exec 9>"$_GAUGE_FIFO"
 }
-
 wt_gauge_update() {
   local pct="$1" label="${2:-}"
-  if [[ -n "$label" ]]; then
-    printf 'XXX\n%d\n%s\nXXX\n' "$pct" "$label" >&9
+  [[ -n "$label" ]] \
+    && printf 'XXX\n%d\n%s\nXXX\n' "$pct" "$label" >&9 \
+    || printf '%d\n' "$pct" >&9
+}
+wt_gauge_done() {
+  exec 9>&-
+  wait "$GAUGE_PID" 2>/dev/null || true
+  rm -f "$_GAUGE_FIFO"; GAUGE_PID=""; _GAUGE_FIFO=""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── ZENITY WRAPPERS ──────────────────────────────────────────────────────────
+#
+# Zenity produces GTK dialogs — requires $DISPLAY or $WAYLAND_DISPLAY.
+# Result is captured via $() safely here because zenity writes its output to
+# stdout (not stderr), so no fd-swap is needed and the subshell captures it
+# correctly.  A shared _ZN_RESULT variable mirrors _WT_RESULT for symmetry.
+# ─────────────────────────────────────────────────────────────────────────────
+_ZN_RESULT=""
+
+# zn_input <title> <prompt> <default> → _ZN_RESULT; rc 0=Ok 1=Cancel
+zn_input() {
+  local out
+  out="$(zenity --title "$1" \
+                --entry \
+                --text "$2" \
+                --entry-text "$3" 2>/dev/null)"
+  local rc=$?; _ZN_RESULT="$out"; return $rc
+}
+
+# zn_checklist <title> <prompt> <tag> <desc> <ON|OFF> [...] → _ZN_RESULT
+# Zenity checklist takes: --column "Col" [val val val ...]
+# We build a --list --checklist with columns "Pick" and "Repo".
+zn_checklist() {
+  local title="$1" prompt="$2"; shift 2
+  # Args arrive as triplets: tag "" ON|OFF
+  local zn_args=()
+  while [[ $# -ge 3 ]]; do
+    local tag="$1" _desc="$2" state="$3"; shift 3
+    [[ "$state" == "ON" ]] && zn_args+=("TRUE" "$tag") || zn_args+=("FALSE" "$tag")
+  done
+  local out
+  out="$(zenity --title "$title" \
+                --list \
+                --checklist \
+                --text "$prompt" \
+                --column " " \
+                --column "Repository" \
+                --separator " " \
+                "${zn_args[@]}" 2>/dev/null)"
+  local rc=$?; _ZN_RESULT="$out"; return $rc
+}
+
+zn_msg() {
+  zenity --title "$1" --info --text "$2" --width 500 2>/dev/null || true
+}
+zn_error() {
+  zenity --title "✘  $1" --error --text "$2" --width 500 2>/dev/null || true
+}
+
+# Zenity progress — driven via a background process reading from fd 9 (same
+# FIFO pattern as whiptail, but zenity --progress reads "pct\n" lines).
+# zenity --progress does not support mid-flight label changes, so we use
+# --title for the static label and just send percentages.
+zn_gauge_start() {
+  _GAUGE_FIFO="$(mktemp -u /tmp/_zn_gauge_XXXXXX)"
+  mkfifo "$_GAUGE_FIFO"
+  zenity --title "$1" \
+         --progress \
+         --text "$2" \
+         --percentage=0 \
+         --auto-close \
+         < "$_GAUGE_FIFO" &
+  GAUGE_PID=$!
+  exec 9>"$_GAUGE_FIFO"
+}
+zn_gauge_update() {
+  # zenity --progress only reads bare integers; ignore the label arg
+  printf '%d\n' "$1" >&9
+}
+zn_gauge_done() {
+  printf '100\n' >&9
+  exec 9>&-
+  wait "$GAUGE_PID" 2>/dev/null || true
+  rm -f "$_GAUGE_FIFO"; GAUGE_PID=""; _GAUGE_FIFO=""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ── UNIFIED UI DISPATCHERS ────────────────────────────────────────────────────
+#
+# All call sites below use ui_* exclusively — no backend knowledge needed.
+# DIALOG_BACKEND ("whiptail" | "zenity") is set in Step 2.
+# _UI_RESULT is the single variable callers read for input/checklist results.
+# ─────────────────────────────────────────────────────────────────────────────
+_UI_RESULT=""
+
+ui_input() {
+  if [[ "$DIALOG_BACKEND" == "zenity" ]]; then
+    zn_input "$@"; local rc=$?; _UI_RESULT="$_ZN_RESULT"; return $rc
   else
-    printf '%d\n' "$pct" >&9
+    wt_input "$@"; local rc=$?; _UI_RESULT="$_WT_RESULT"; return $rc
   fi
 }
 
-wt_gauge_done() {
-  exec 9>&-                              # close write end → whiptail sees EOF → exits
-  wait "$GAUGE_PID" 2>/dev/null || true
-  rm -f "$_GAUGE_FIFO"
-  GAUGE_PID=""; _GAUGE_FIFO=""
+ui_checklist() {
+  if [[ "$DIALOG_BACKEND" == "zenity" ]]; then
+    zn_checklist "$@"; local rc=$?; _UI_RESULT="$_ZN_RESULT"; return $rc
+  else
+    wt_checklist "$@"; local rc=$?; _UI_RESULT="$_WT_RESULT"; return $rc
+  fi
 }
+
+ui_msg()   { [[ "$DIALOG_BACKEND" == "zenity" ]] && zn_msg   "$@" || wt_msg   "$@"; }
+ui_error() { [[ "$DIALOG_BACKEND" == "zenity" ]] && zn_error "$@" || wt_error "$@"; }
+
+ui_gauge_start()  { [[ "$DIALOG_BACKEND" == "zenity" ]] && zn_gauge_start  "$@" || wt_gauge_start  "$@"; }
+ui_gauge_update() { [[ "$DIALOG_BACKEND" == "zenity" ]] && zn_gauge_update "$@" || wt_gauge_update "$@"; }
+ui_gauge_done()   { [[ "$DIALOG_BACKEND" == "zenity" ]] && zn_gauge_done        || wt_gauge_done;        }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OS / PACKAGE-MANAGER DETECTION
@@ -435,6 +504,34 @@ whiptail_remove_cmd() {
   esac
 }
 
+zenity_install_cmd() {
+  case "$1" in
+    apt-get) echo "apt-get install -y zenity"    ;;
+    dnf)     echo "dnf install -y zenity"        ;;
+    yum)     echo "yum install -y zenity"        ;;
+    pacman)  echo "pacman -S --noconfirm zenity" ;;
+    zypper)  echo "zypper install -y zenity"     ;;
+    brew)    echo "brew install --cask zenity"   ;;
+    *)       echo ""                             ;;
+  esac
+}
+
+zenity_remove_cmd() {
+  case "$1" in
+    apt-get) echo "apt-get remove -y zenity"      ;;
+    dnf)     echo "dnf remove -y zenity"          ;;
+    yum)     echo "yum remove -y zenity"          ;;
+    pacman)  echo "pacman -Rs --noconfirm zenity" ;;
+    zypper)  echo "zypper remove -y zenity"       ;;
+    brew)    echo "brew uninstall --cask zenity"  ;;
+    *)       echo ""                              ;;
+  esac
+}
+
+# Return install/remove commands for whichever backend was chosen
+dialog_install_cmd() { "${DIALOG_BACKEND}_install_cmd" "$1"; }
+dialog_remove_cmd()  { "${DIALOG_BACKEND}_remove_cmd"  "$1"; }
+
 needs_sudo() { [[ $EUID -ne 0 && "$1" != "macos" ]] && echo "sudo" || echo ""; }
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -459,9 +556,10 @@ box "$CYN" "🚀  morganism  bootstrap" \
   "This script will:" \
   "" \
   "${CYN}①${R}  Detect your OS and select the right package manager" \
-  "${CYN}②${R}  Install whiptail (TUI dialog helper) + any dependencies" \
-  "${CYN}③${R}  Clone your selected morganism GitHub repositories" \
-  "${CYN}④${R}  Optionally remove whiptail when done" \
+  "${CYN}②${R}  Choose a UI backend: whiptail ${DIM}(ncurses)${R} or Zenity ${DIM}(GTK)${R}" \
+  "${CYN}③${R}  Install the chosen dialog helper + any dependencies" \
+  "${CYN}④${R}  Clone your selected morganism GitHub repositories" \
+  "${CYN}⑤${R}  Optionally remove the dialog helper when done" \
   "" \
   "${DIM}Log file → ${LOG}${R}" \
   "" \
@@ -484,69 +582,116 @@ printf "\n  ${GRN}✔  Confirmed — proceeding.${R}\n\n" > /dev/tty
 log "Welcome confirmed"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — WHIPTAIL CLEANUP POLICY (3s, default = retain)
+# STEP 2 — UI BACKEND SELECTION
+#
+# If a graphical display is available we offer the choice; otherwise whiptail
+# is the only option and we skip the prompt entirely.
+# Timed default (5 s): whiptail — so headless pipes never block.
 # ─────────────────────────────────────────────────────────────────────────────
-box "$MGT" "🧹  whiptail cleanup policy" \
+log_section "Step 2 — UI backend selection"
+
+HAS_DISPLAY=false
+[[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]] && HAS_DISPLAY=true
+log "HAS_DISPLAY=${HAS_DISPLAY}  DISPLAY='${DISPLAY:-}'  WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-}'"
+
+if $HAS_DISPLAY; then
+  box "$CYN" "🖥️  UI dialog backend" \
+    "" \
+    "A graphical display was detected.  Choose your dialog style:" \
+    "" \
+    "${CYN}w${R}  =  whiptail  ${DIM}(ncurses TUI — works everywhere, default)${R}" \
+    "${MGT}z${R}  =  Zenity    ${DIM}(GTK GUI  — requires graphical session)${R}" \
+    "" \
+    "${DIM}Any other key or 5-second timeout → whiptail${R}" \
+    ""
+
+  key="$(read_key_timed 5)"
+  log_prompt "Backend selection → key='${key:-<timeout>}'"
+
+  if [[ "${key,,}" == "z" ]]; then
+    DIALOG_BACKEND="zenity"
+    printf "\n  ${MGT}✔  Zenity (GTK) selected.${R}\n\n" > /dev/tty
+    log "Backend: zenity"
+  else
+    DIALOG_BACKEND="whiptail"
+    printf "\n  ${CYN}✔  whiptail (ncurses) selected.${R}\n\n" > /dev/tty
+    log "Backend: whiptail"
+  fi
+else
+  DIALOG_BACKEND="whiptail"
+  printf "  ${DIM}No graphical display — using whiptail.${R}\n\n" > /dev/tty
+  log "Backend: whiptail (no display)"
+fi
+
+sleep 0.4
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — DIALOG CLEANUP POLICY (3s, default = retain)
+# ─────────────────────────────────────────────────────────────────────────────
+box "$MGT" "🧹  dialog cleanup policy" \
   "" \
-  "whiptail (TUI dialog) will be installed as a UI helper." \
+  "${BOLD}${DIALOG_BACKEND}${R} will be installed as a UI helper." \
   "Should it be UNINSTALLED when this script finishes?" \
   "" \
-  "${MGT}y${R}  =  remove whiptail after completion" \
-  "${GRN}n${R}  =  keep whiptail  ${DIM}(default — activates after 3 s)${R}" \
+  "${MGT}y${R}  =  remove ${DIALOG_BACKEND} after completion" \
+  "${GRN}n${R}  =  keep ${DIALOG_BACKEND}  ${DIM}(default — activates after 3 s)${R}" \
   ""
 
-log_section "Step 2 — cleanup policy (3s, default=n)"
+log_section "Step 3 — cleanup policy (3s, default=n)"
 key="$(read_key_timed 3)"
 log_prompt "Cleanup policy → key='${key:-<timeout>}'"
 
 if [[ "${key,,}" == "y" ]]; then
-  CLEANUP_WHIPTAIL=true
-  printf "\n  ${YLW}⚑  whiptail will be removed after completion.${R}\n\n" > /dev/tty
+  CLEANUP_DIALOG=true
+  printf "\n  ${YLW}⚑  ${DIALOG_BACKEND} will be removed after completion.${R}\n\n" > /dev/tty
   log "Cleanup policy: REMOVE"
 else
-  CLEANUP_WHIPTAIL=false
-  printf "\n  ${GRN}✔  whiptail will be retained.${R}\n\n" > /dev/tty
+  CLEANUP_DIALOG=false
+  printf "\n  ${GRN}✔  ${DIALOG_BACKEND} will be retained.${R}\n\n" > /dev/tty
   log "Cleanup policy: RETAIN"
 fi
 
 sleep 0.6
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — OS DETECTION + WHIPTAIL INSTALL
+# STEP 4 — OS DETECTION + DIALOG BACKEND INSTALL
 # ─────────────────────────────────────────────────────────────────────────────
-log_section "Step 3 — OS detection + whiptail install"
+log_section "Step 4 — OS detection + ${DIALOG_BACKEND} install"
 
 OS="$(detect_os)"
 PM="$(pkg_manager "$OS")"
 SUDO="$(needs_sudo "$OS")"
-INSTALL_CMD="$(whiptail_install_cmd "$PM")"
-REMOVE_CMD="$(whiptail_remove_cmd "$PM")"
-CLEANUP_LABEL="$( $CLEANUP_WHIPTAIL && echo 'removed after run' || echo 'retained' )"
+INSTALL_CMD="$(dialog_install_cmd "$PM")"
+REMOVE_CMD="$(dialog_remove_cmd "$PM")"
+CLEANUP_LABEL="$( $CLEANUP_DIALOG && echo 'removed after run' || echo 'retained' )"
 
 log "OS family       : ${OS}"
 log "Package manager : ${PM}"
+log "Dialog backend  : ${DIALOG_BACKEND}"
 log "Install command : ${SUDO} ${INSTALL_CMD:-N/A}"
 log "Remove command  : ${SUDO} ${REMOVE_CMD:-N/A}"
 log "Cleanup policy  : ${CLEANUP_LABEL}"
 
-command -v whiptail &>/dev/null && WHIPTAIL_WAS_PREINSTALLED=true \
-  && log "whiptail already installed: $(command -v whiptail)"
+command -v "$DIALOG_BACKEND" &>/dev/null && DIALOG_WAS_PREINSTALLED=true \
+  && log "${DIALOG_BACKEND} already installed: $(command -v "$DIALOG_BACKEND")"
 
 box "$BLU" "📦  System setup" \
   "" \
   "OS family       : ${BOLD}${OS}${R}" \
   "Package manager : ${BOLD}${PM}${R}" \
+  "Dialog backend  : ${BOLD}${DIALOG_BACKEND}${R}" \
   "Install command : ${DIM}${SUDO} ${INSTALL_CMD:-N/A (OS unknown)}${R}" \
-  "whiptail policy : ${BOLD}${CLEANUP_LABEL}${R}" \
+  "Dialog policy   : ${BOLD}${CLEANUP_LABEL}${R}" \
   "Log file        : ${DIM}${LOG}${R}" \
   ""
 
-if $WHIPTAIL_WAS_PREINSTALLED; then
-  printf "  ${GRN}✔  whiptail already present — skipping install.${R}\n\n" > /dev/tty
+if $DIALOG_WAS_PREINSTALLED; then
+  printf "  ${GRN}✔  %s already present — skipping install.${R}\n\n" "$DIALOG_BACKEND" > /dev/tty
   log "Skipping install"
 else
   if [[ "$PM" == "unknown" || -z "$INSTALL_CMD" ]]; then
-    printf "\n  ${RED}✘  Unrecognised OS / package manager.  Cannot install whiptail.${R}\n" > /dev/tty
+    printf "\n  ${RED}✘  Unrecognised OS / package manager.  Cannot install %s.${R}\n" \
+      "$DIALOG_BACKEND" > /dev/tty
     printf "  ${DIM}Log: %s${R}\n\n" "$LOG" > /dev/tty
     log_error "Unknown PM — aborting"
     exit 1
@@ -564,37 +709,39 @@ else
   # Debian: refresh apt cache first
   if [[ "$PM" == "apt-get" ]]; then
     log_package "apt-get update"
+    # shellcheck disable=SC2086
     run_logged "Refreshing package cache" $SUDO apt-get update -qq
   fi
 
-  # Install whiptail
+  # Install the chosen backend
   log_package "Running: ${SUDO} ${INSTALL_CMD}"
   # shellcheck disable=SC2086
-  if run_logged "Installing whiptail" $SUDO $INSTALL_CMD; then
-    log_package "whiptail installation succeeded"
+  if run_logged "Installing ${DIALOG_BACKEND}" $SUDO $INSTALL_CMD; then
+    log_package "${DIALOG_BACKEND} installation succeeded"
   else
-    printf "\n  ${RED}✘  whiptail install failed — see log: %s${R}\n" "$LOG" > /dev/tty
-    log_error "whiptail install failed"
+    printf "\n  ${RED}✘  %s install failed — see log: %s${R}\n" "$DIALOG_BACKEND" "$LOG" > /dev/tty
+    log_error "${DIALOG_BACKEND} install failed"
     exit 1
   fi
 fi
 
 # Sanity-check
-if ! command -v whiptail &>/dev/null; then
-  printf "\n  ${RED}✘  whiptail not found after install attempt. Aborting.${R}\n" > /dev/tty
-  log_error "whiptail not available post-install"
+if ! command -v "$DIALOG_BACKEND" &>/dev/null; then
+  printf "\n  ${RED}✘  %s not found after install attempt. Aborting.${R}\n" \
+    "$DIALOG_BACKEND" > /dev/tty
+  log_error "${DIALOG_BACKEND} not available post-install"
   exit 1
 fi
-log "whiptail path: $(command -v whiptail)"
+log "${DIALOG_BACKEND} path: $(command -v "$DIALOG_BACKEND")"
 
 ansi_bar "System ready:"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — BASE_PATH (whiptail inputbox)
+# STEP 5 — BASE_PATH (dialog input)
 # ─────────────────────────────────────────────────────────────────────────────
-log_section "Step 4 — BASE_PATH selection"
+log_section "Step 5 — BASE_PATH selection"
 
-wt_input \
+ui_input \
   "morganism bootstrap — Source directory" \
   "Base path for cloned repositories:" \
   "${DEFAULT_BASE_PATH}" || {
@@ -602,20 +749,20 @@ wt_input \
   printf "  ${RED}✘  Cancelled.${R}\n" > /dev/tty
   exit 1
 }
-BASE_PATH="$_WT_RESULT"
+BASE_PATH="$_UI_RESULT"
 
 BASE_PATH="${BASE_PATH/#\~/$HOME}"
 [[ -z "$BASE_PATH" ]] && BASE_PATH="$DEFAULT_BASE_PATH"
 log_prompt "BASE_PATH = ${BASE_PATH}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 5 — FETCH REPO LIST + WHIPTAIL CHECKLIST
+# STEP 6 — FETCH REPO LIST + DIALOG CHECKLIST
 # ─────────────────────────────────────────────────────────────────────────────
-log_section "Step 5 — Repository selection"
+log_section "Step 6 — Repository selection"
 log "Fetching repo list: ${REPOS_URL}"
 
 REPOS_RAW="$(curl -fsSL "$REPOS_URL" 2>>"$LOG")" || {
-  wt_error "Bootstrap — fetch error" \
+  ui_error "Bootstrap — fetch error" \
     "Failed to fetch repository list from:\n${REPOS_URL}\n\nSee log: ${LOG}"
   log_error "Failed to fetch ${REPOS_URL}"
   exit 1
@@ -624,7 +771,7 @@ REPOS_RAW="$(curl -fsSL "$REPOS_URL" 2>>"$LOG")" || {
 log "Raw repos:"
 printf '%s\n' "$REPOS_RAW" >> "$LOG"
 
-# Build whiptail checklist args: <tag> <description> <ON|OFF>
+# Build checklist args: <tag> <description> <ON|OFF>
 WT_REPO_ARGS=()
 while IFS= read -r repo; do
   repo="$(printf '%s' "$repo" | tr -d '[:space:]')"
@@ -633,13 +780,13 @@ while IFS= read -r repo; do
 done <<< "$REPOS_RAW"
 
 if [[ ${#WT_REPO_ARGS[@]} -eq 0 ]]; then
-  wt_error "Bootstrap — no repos" \
+  ui_error "Bootstrap — no repos" \
     "bootstrap.repos appears to be empty.\nURL: ${REPOS_URL}"
   log_error "Empty repos list"
   exit 1
 fi
 
-wt_checklist \
+ui_checklist \
   "morganism bootstrap — Repository selection" \
   "Select repositories to clone into:\n${BASE_PATH}\n\nAll pre-selected — untick any you don't want." \
   "${WT_REPO_ARGS[@]}" || {
@@ -647,11 +794,11 @@ wt_checklist \
   printf "  ${RED}✘  Cancelled.${R}\n" > /dev/tty
   exit 1
 }
-SELECTION="$_WT_RESULT"
+SELECTION="$_UI_RESULT"
 
 log_prompt "Repo selection raw: ${SELECTION}"
 
-# whiptail checklist returns quoted space-separated tokens; strip quotes
+# Strip surrounding quotes (whiptail wraps selections in quotes; zenity doesn't)
 SELECTED_REPOS=()
 for token in $SELECTION; do
   token="${token//\"/}"
@@ -660,12 +807,12 @@ done
 log "Selected: ${SELECTED_REPOS[*]:-<none>}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 6 — CLONE (whiptail gauge progress bar)
+# STEP 7 — CLONE (dialog progress bar)
 # ─────────────────────────────────────────────────────────────────────────────
-log_section "Step 6 — Cloning repositories"
+log_section "Step 7 — Cloning repositories"
 
 if [[ ${#SELECTED_REPOS[@]} -eq 0 ]]; then
-  wt_msg "morganism bootstrap — Nothing to do" \
+  ui_msg "morganism bootstrap — Nothing to do" \
     "No repositories were selected.\n\nExiting."
   log_warn "No repos selected"
 else
@@ -673,7 +820,7 @@ else
   log_file "$BASE_PATH (base directory)"
 
   total="${#SELECTED_REPOS[@]}"
-  wt_gauge_start "morganism bootstrap — Cloning" "Initialising…"
+  ui_gauge_start "morganism bootstrap — Cloning" "Initialising…"
 
   idx=0
   for repo in "${SELECTED_REPOS[@]}"; do
@@ -681,7 +828,7 @@ else
     pct=$(( idx * 100 / total ))
     dest="${BASE_PATH}/${repo}"
 
-    wt_gauge_update "$pct" "Cloning ${repo}  (${idx} / ${total})…"
+    ui_gauge_update "$pct" "Cloning ${repo}  (${idx} / ${total})…"
 
     if [[ -d "${dest}/.git" ]]; then
       log_clone "PULL  ${dest}"
@@ -697,8 +844,8 @@ else
     fi
   done
 
-  wt_gauge_update 100 "All done."
-  wt_gauge_done
+  ui_gauge_update 100 "All done."
+  ui_gauge_done
 
   for repo in "${SELECTED_REPOS[@]}"; do
     dest="${BASE_PATH}/${repo}"
@@ -712,58 +859,58 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 7 — CLEANUP WHIPTAIL (if requested and we installed it)
+# STEP 8 — CLEANUP DIALOG BACKEND (if requested and we installed it)
 # ─────────────────────────────────────────────────────────────────────────────
-log_section "Step 7 — post-run cleanup"
+log_section "Step 8 — post-run cleanup"
 
-if $CLEANUP_WHIPTAIL && ! $WHIPTAIL_WAS_PREINSTALLED && [[ -n "$REMOVE_CMD" ]]; then
-  log_package "Removing whiptail: ${SUDO} ${REMOVE_CMD}"
+if $CLEANUP_DIALOG && ! $DIALOG_WAS_PREINSTALLED && [[ -n "$REMOVE_CMD" ]]; then
+  log_package "Removing ${DIALOG_BACKEND}: ${SUDO} ${REMOVE_CMD}"
   # shellcheck disable=SC2086
   $SUDO $REMOVE_CMD >> "$LOG" 2>&1 \
-    && log_package "whiptail removed" \
-    || log_warn "whiptail removal failed (see log)"
+    && log_package "${DIALOG_BACKEND} removed" \
+    || log_warn "${DIALOG_BACKEND} removal failed (see log)"
 else
-  log "whiptail retained"
+  log "${DIALOG_BACKEND} retained"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 8 — SUMMARY
+# STEP 9 — SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
-log_section "Step 8 — summary"
+log_section "Step 9 — summary"
 
-cleanup_str="$( $CLEANUP_WHIPTAIL && ! $WHIPTAIL_WAS_PREINSTALLED \
+cleanup_str="$( $CLEANUP_DIALOG && ! $DIALOG_WAS_PREINSTALLED \
   && echo 'Removed ✔' || echo 'Retained' )"
 
-# whiptail summary msgbox
-summary_wt="morganism bootstrap — complete\n\n"
-summary_wt+="Base path : ${BASE_PATH}\n"
-summary_wt+="Log file  : ${LOG}\n\n"
-summary_wt+="Cloned:\n"
-for r in "${CLONED_REPOS[@]+"${CLONED_REPOS[@]}"}"; do summary_wt+="  ✔  ${r}\n"; done
-[[ ${#CLONED_REPOS[@]} -eq 0 ]] && summary_wt+="  (none)\n"
+# Dialog summary msgbox
+summary_txt="morganism bootstrap — complete\n\n"
+summary_txt+="Base path : ${BASE_PATH}\n"
+summary_txt+="Log file  : ${LOG}\n\n"
+summary_txt+="Cloned:\n"
+for r in "${CLONED_REPOS[@]+"${CLONED_REPOS[@]}"}"; do summary_txt+="  ✔  ${r}\n"; done
+[[ ${#CLONED_REPOS[@]} -eq 0 ]] && summary_txt+="  (none)\n"
 if [[ ${#FAILED_REPOS[@]} -gt 0 ]]; then
-  summary_wt+="\nFailed:\n"
-  for r in "${FAILED_REPOS[@]}"; do summary_wt+="  ✘  ${r}\n"; done
+  summary_txt+="\nFailed:\n"
+  for r in "${FAILED_REPOS[@]}"; do summary_txt+="  ✘  ${r}\n"; done
 fi
-summary_wt+="\nwhiptail : ${cleanup_str}"
+summary_txt+="\n${DIALOG_BACKEND} : ${cleanup_str}"
 
-log "Summary — cloned   : ${CLONED_REPOS[*]:-none}"
-log "Summary — failed   : ${FAILED_REPOS[*]:-none}"
-log "Summary — whiptail : ${cleanup_str}"
+log "Summary — cloned         : ${CLONED_REPOS[*]:-none}"
+log "Summary — failed         : ${FAILED_REPOS[*]:-none}"
+log "Summary — dialog backend : ${DIALOG_BACKEND} (${cleanup_str})"
 log "Bootstrap complete"
 
-command -v whiptail &>/dev/null && wt_msg "morganism bootstrap — Done" "$summary_wt" || true
+command -v "$DIALOG_BACKEND" &>/dev/null && ui_msg "morganism bootstrap — Done" "$summary_txt" || true
 
-# Terminal summary box (always shown, no whiptail dependency)
+# Terminal summary box (always shown, no dialog dependency)
 printf '\n' > /dev/tty
 box "$GRN" "✔  Bootstrap complete" \
   "" \
-  "Base path  : ${BASE_PATH}" \
-  "Log file   : ${LOG}" \
+  "Base path      : ${BASE_PATH}" \
+  "Log file       : ${LOG}" \
   "" \
-  "Cloned     : ${CLONED_REPOS[*]:-none}" \
-  "Failed     : ${FAILED_REPOS[*]:-none}" \
-  "whiptail   : ${cleanup_str}" \
+  "Cloned         : ${CLONED_REPOS[*]:-none}" \
+  "Failed         : ${FAILED_REPOS[*]:-none}" \
+  "Dialog backend : ${DIALOG_BACKEND} — ${cleanup_str}" \
   ""
 printf "  ${DIM}Full log → ${YLW}%s${R}\n\n" "$LOG" > /dev/tty
 
