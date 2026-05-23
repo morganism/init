@@ -584,9 +584,9 @@ log "Welcome confirmed"
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2 — UI BACKEND SELECTION
 #
-# If a graphical display is available we offer the choice; otherwise whiptail
-# is the only option and we skip the prompt entirely.
-# Timed default (5 s): whiptail — so headless pipes never block.
+# If a graphical display is available, Zenity (GTK) is the default — the user
+# can press w within 5 seconds to switch to whiptail instead.
+# If no display is detected, whiptail is the only option; the prompt is skipped.
 # ─────────────────────────────────────────────────────────────────────────────
 log_section "Step 2 — UI backend selection"
 
@@ -599,31 +599,29 @@ if $HAS_DISPLAY; then
     "" \
     "A graphical display was detected.  Choose your dialog style:" \
     "" \
-    "${CYN}w${R}  =  whiptail  ${DIM}(ncurses TUI — works everywhere, default)${R}" \
-    "${MGT}z${R}  =  Zenity    ${DIM}(GTK GUI  — requires graphical session)${R}" \
+    "${MGT}z${R}  =  Zenity    ${DIM}(GTK GUI  — graphical session, default)${R}" \
+    "${CYN}w${R}  =  whiptail  ${DIM}(ncurses TUI — works everywhere)${R}" \
     "" \
-    "${DIM}Any other key or 5-second timeout → whiptail${R}" \
+    "${DIM}Any other key or 5-second timeout → Zenity${R}" \
     ""
 
   key="$(read_key_timed 5)"
   log_prompt "Backend selection → key='${key:-<timeout>}'"
 
-  if [[ "${key,,}" == "z" ]]; then
-    DIALOG_BACKEND="zenity"
-    printf "\n  ${MGT}✔  Zenity (GTK) selected.${R}\n\n" > /dev/tty
-    log "Backend: zenity"
-  else
+  if [[ "${key,,}" == "w" ]]; then
     DIALOG_BACKEND="whiptail"
     printf "\n  ${CYN}✔  whiptail (ncurses) selected.${R}\n\n" > /dev/tty
     log "Backend: whiptail"
+  else
+    DIALOG_BACKEND="zenity"
+    printf "\n  ${MGT}✔  Zenity (GTK) selected.${R}\n\n" > /dev/tty
+    log "Backend: zenity"
   fi
 else
   DIALOG_BACKEND="whiptail"
   printf "  ${DIM}No graphical display — using whiptail.${R}\n\n" > /dev/tty
   log "Backend: whiptail (no display)"
 fi
-
-sleep 0.4
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 3 — DIALOG CLEANUP POLICY (3s, default = retain)
