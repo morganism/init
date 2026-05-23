@@ -355,7 +355,7 @@ zn_input() {
   out="$(zenity --title "$1" \
                 --entry \
                 --text "$2" \
-                --entry-text "$3" 2>/dev/null)"
+                --entry-text "$3" 2>/dev/null)" 2>/dev/null
   local rc=$?; _ZN_RESULT="$out"; return $rc
 }
 
@@ -378,7 +378,7 @@ zn_checklist() {
                 --column " " \
                 --column "Repository" \
                 --separator " " \
-                "${zn_args[@]}" 2>/dev/null)"
+                "${zn_args[@]}" 2>/dev/null)" 2>/dev/null
   local rc=$?; _ZN_RESULT="$out"; return $rc
 }
 
@@ -401,7 +401,7 @@ zn_gauge_start() {
          --text "$2" \
          --percentage=0 \
          --auto-close \
-         < "$_GAUGE_FIFO" &
+         < "$_GAUGE_FIFO" 2>/dev/null &
   GAUGE_PID=$!
   exec 9>"$_GAUGE_FIFO"
 }
