@@ -4,11 +4,13 @@ bootstrap.sh — morganism init bootstrap
 ════════════════════════════════════════════════════════════════
 Bootstraps a new machine by:
   • Detecting OS and selecting the right package manager
-  • Installing Zenity (GTK dialog helper) and dependencies
-  • Prompting (via Zenity) for a base path and repo selection
+  • Installing whiptail (TUI ncurses dialog) + dependencies
+  • Prompting (via whiptail) for a base path and repo selection
   • Cloning selected morganism GitHub repositories
-  • Optionally removing Zenity after completion
+  • Optionally removing whiptail after completion
   • Logging every action, prompt answer, package and file path
+
+No DISPLAY/Wayland required — whiptail uses /dev/tty directly.
 
 Usage:
   curl -fsSL https://raw.githubusercontent.com/morganism/init/refs/heads/master/bootstrap.sh | bash
@@ -29,8 +31,8 @@ readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 readonly LOG="/tmp/bootstrap_${TIMESTAMP}.log"
 readonly REPOS_URL="https://raw.githubusercontent.com/morganism/init/refs/heads/master/bootstrap.repos"
 readonly DEFAULT_BASE_PATH="${HOME}/src/morganism"
-CLEANUP_ZENITY=false
-ZENITY_WAS_PREINSTALLED=false
+CLEANUP_WHIPTAIL=false
+WHIPTAIL_WAS_PREINSTALLED=false
 BASE_PATH=""
 declare -a SELECTED_REPOS=()
 declare -a CLONED_REPOS=()
@@ -65,56 +67,117 @@ log_warn()    { _log "[WARN]    $*"; }
 log_error()   { _log "[ERROR]   $*"; }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANSI-AWARE PADDING
-# printf counts invisible ESC bytes toward field width, so %-*s gives wrong
-# padding whenever a string contains colour codes.  Strip ANSI bytes first,
-# measure visual length, then pad with spaces manually.
+# ANSI-AWARE, UNICODE-AWARE STRING HELPERS
+#
+# Problem: printf's %-*s counts raw bytes, not display columns.
+#   • ANSI escape sequences add invisible bytes → over-pads
+#   • Emoji / wide chars occupy 2 terminal columns but are 1 codepoint → under-pads
+#
+# Solution:
+#   _strip_ansi  — remove all ESC[...m sequences, leaving only printable text
+#   _display_width — measure terminal display columns (not bytes, not codepoints)
+#     Uses python3 unicodedata.east_asian_width when available (accurate for
+#     emoji, wide CJK, etc.).  Falls back to wc -m (codepoint count) which is
+#     correct for all non-wide Unicode.
+#   _vlen  — visible display width of a string that may contain ANSI codes
+#   _rpad  — right-pad a (possibly ANSI-coloured) string to a target display width
 # ─────────────────────────────────────────────────────────────────────────────
 _strip_ansi() {
-  # Literal ESC in the sed pattern via $'...' — works on both GNU and BSD sed
+  # Literal ESC via $'...' — portable across GNU and BSD sed
   printf '%s' "$1" | sed $'s/\033\\[[0-9;]*[a-zA-Z]//g'
 }
 
-# Right-pad $1 to $2 visible columns, return full (ANSI + padding) string
+_display_width() {
+  # Returns the number of terminal columns occupied by string $1.
+  # python3 unicodedata correctly handles emoji (W/F = 2 cols) and plain chars.
+  # wc -m fallback counts Unicode codepoints (correct for non-wide chars).
+  local s="$1"
+  if command -v python3 &>/dev/null; then
+    python3 -c "
+import unicodedata, sys
+s = sys.argv[1]
+print(sum(2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1 for c in s))
+" "$s"
+  else
+    printf '%s' "$s" | wc -m | tr -d ' \t'
+  fi
+}
+
+_vlen() {
+  # Visible display width of a string that may contain ANSI codes
+  local plain; plain="$(_strip_ansi "$1")"
+  _display_width "$plain"
+}
+
+# Right-pad $1 to exactly $2 visible columns (ANSI codes preserved, don't count)
 _rpad() {
   local s="$1" width="$2"
-  local visible; visible="$(_strip_ansi "$s")"
-  local vlen="${#visible}"
-  local pad=$(( width - vlen ))
+  local vl; vl="$(_vlen "$s")"
+  local pad=$(( width - vl ))
   [[ $pad -lt 0 ]] && pad=0
   printf '%s%*s' "$s" "$pad" ""
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TERMINAL BOX  (all output → /dev/tty so it works inside curl|bash pipes)
+#
 # Usage: box <border_colour> <title> [body_line ...]
-# Body lines may contain ANSI codes — padding is calculated on visible width.
+#        Body lines may contain ANSI codes.
+#
+# Width W is computed dynamically: W = max visible width of any line + 4
+# (2 cols left margin + 2 cols right margin inside the ║ borders).
+# This guarantees the right ║ always lands in the correct column regardless
+# of emoji, circled numbers, coloured text, or any other Unicode content.
+#
+# Each rendered line is exactly (W + 2) terminal columns:
+#   ║  [content padded to W-2 cols]  ║
+#   1  2                        W-1  W  W+1  W+2   (cols, 1-indexed)
 # ─────────────────────────────────────────────────────────────────────────────
 box() {
   local col="$1" title="$2"; shift 2
-  local W=62   # visible inner width (between ║ borders)
 
-  # Build border bar
-  local bar; bar="$(printf '═%.0s' $(seq 1 $W))"
-
-  printf "${col}╔${bar}╗${R}\n" > /dev/tty
-
-  # Title line — use _rpad so ANSI codes in title don't skew field width.
-  # Inner cell is W chars wide; _rpad fills to W-2 then we add one space
-  # on each side (the leading space is baked into the _rpad call).
-  local title_padded; title_padded="$(_rpad " ${BOLD}${col} ${title}${R}" "$((W - 1))")"
-  printf "${col}║${R}%s ${col}║${R}\n" "$title_padded" > /dev/tty
-
-  printf "${col}╠${bar}╣${R}\n" > /dev/tty
-
-  local line padded
+  # ── compute W: widest visible line content + 4 margin cols ──────────────
+  local W=40  # minimum inner width
+  local tv needed
+  tv="$(_vlen "$title")"
+  needed=$(( tv + 4 )); [[ $needed -gt $W ]] && W=$needed
   for line in "$@"; do
-    # Two leading spaces + content + padding to fill to W-2 + two trailing spaces
-    padded="$(_rpad "  ${line}" "$((W - 2))")"
-    printf "${col}║${R}%s  ${col}║${R}\n" "$padded" > /dev/tty
+    local lv; lv="$(_vlen "$line")"
+    needed=$(( lv + 4 )); [[ $needed -gt $W ]] && W=$needed
   done
 
-  printf "${col}╚${bar}╝${R}\n" > /dev/tty
+  # ── horizontal bar: W '═' chars ─────────────────────────────────────────
+  # python3 is already confirmed above; use it for clean Unicode repetition.
+  # Fallback: printf loop (works even without python3).
+  local bar
+  if command -v python3 &>/dev/null; then
+    bar="$(python3 -c "print('═' * ${W}, end='')")"
+  else
+    bar="$(printf '═%.0s' $(seq 1 "$W"))"
+  fi
+
+  # ── top border ──────────────────────────────────────────────────────────
+  printf '%s╔%s╗%s\n' "$col" "$bar" "$R" > /dev/tty
+
+  # ── title line ──────────────────────────────────────────────────────────
+  # Cell layout: [2-space indent][bold+col title text][padding][2-space margin]
+  # _rpad fills "  title" to (W-2) visible cols; printf appends "  " → W cols total.
+  local title_tok="${BOLD}${col}  ${title}${R}"
+  local title_cell; title_cell="$(_rpad "$title_tok" $(( W - 2 )))"
+  printf '%s║%s%s  %s║%s\n' "$col" "$R" "$title_cell" "$col" "$R" > /dev/tty
+
+  # ── divider ─────────────────────────────────────────────────────────────
+  printf '%s╠%s╣%s\n' "$col" "$bar" "$R" > /dev/tty
+
+  # ── body lines ──────────────────────────────────────────────────────────
+  local line cell
+  for line in "$@"; do
+    cell="$(_rpad "  ${line}" $(( W - 2 )))"
+    printf '%s║%s%s  %s║%s\n' "$col" "$R" "$cell" "$col" "$R" > /dev/tty
+  done
+
+  # ── bottom border ───────────────────────────────────────────────────────
+  printf '%s╚%s╝%s\n' "$col" "$bar" "$R" > /dev/tty
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,13 +218,12 @@ read_key_timed() {
       break
     fi
   done
-  # Clear countdown line
-  printf "\r%80s\r" "" > /dev/tty
+  printf "\r%80s\r" "" > /dev/tty   # clear countdown line
   printf '%s' "$key"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANSI PROGRESS BAR  (decorative fill after package install)
+# ANSI PROGRESS BAR  (decorative fill — used after package install)
 # ─────────────────────────────────────────────────────────────────────────────
 ansi_bar() {
   local label="${1:-Progress:}"
@@ -172,6 +234,90 @@ ansi_bar() {
     sleep 0.025
   done
   printf "] ${GRN}${BOLD}100%%${R}\n\n" > /dev/tty
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WHIPTAIL WRAPPERS
+#
+# whiptail is part of the 'newt' package — a lightweight ncurses TUI library.
+# It reads and writes /dev/tty directly, so:
+#   • No DISPLAY or Wayland socket required
+#   • Works over SSH
+#   • Works in curl|bash pipelines
+#
+# All dialogs use the fd-swap trick (3>&1 1>&2 2>&3) to capture whiptail's
+# output (written to stderr) into the variable while letting its UI use stdout.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# wt_input <title> <prompt> <default>
+# Prints the entered string to stdout; exits non-zero on Cancel.
+wt_input() {
+  whiptail --title "$1" \
+           --inputbox "$2" \
+           12 72 "$3" \
+           3>&1 1>&2 2>&3
+}
+
+# wt_checklist <title> <prompt> <tag> <desc> <status> [...]
+# Prints space-separated quoted selections to stdout; exits non-zero on Cancel.
+wt_checklist() {
+  local title="$1" prompt="$2"; shift 2
+  local n_items=$(( $# / 3 ))
+  local height=$(( n_items + 10 ))
+  [[ $height -gt 35 ]] && height=35
+  whiptail --title "$title" \
+           --checklist "$prompt" \
+           "$height" 72 "$n_items" \
+           "$@" \
+           3>&1 1>&2 2>&3
+}
+
+# wt_msg <title> <text>  — informational OK-dismissable message box
+wt_msg() {
+  whiptail --title "$1" --msgbox "$2" 20 72 3>&1 1>&2 2>&3
+}
+
+# wt_error <title> <text>  — error message box
+wt_error() {
+  whiptail --title "✘  $1" --msgbox "$2" 12 72 3>&1 1>&2 2>&3
+}
+
+# ── gauge (progress bar) ─────────────────────────────────────────────────────
+# whiptail --gauge reads lines from stdin:
+#   • A bare integer  →  set percentage
+#   • XXX / pct / label / XXX  →  update both percentage and label text
+#
+# We open a named FIFO and keep it alive on fd 9 so the gauge stays open
+# while we do real work, then close fd 9 to signal completion.
+# ─────────────────────────────────────────────────────────────────────────────
+GAUGE_PID=""
+_GAUGE_FIFO=""
+
+wt_gauge_start() {
+  local title="$1" init_text="$2"
+  _GAUGE_FIFO="$(mktemp -u /tmp/_wt_gauge_XXXXXX)"
+  mkfifo "$_GAUGE_FIFO"
+  whiptail --title "$title" \
+           --gauge "$init_text" \
+           8 72 0 < "$_GAUGE_FIFO" &
+  GAUGE_PID=$!
+  exec 9>"$_GAUGE_FIFO"   # keep the write end open so whiptail doesn't see EOF
+}
+
+wt_gauge_update() {
+  local pct="$1" label="${2:-}"
+  if [[ -n "$label" ]]; then
+    printf 'XXX\n%d\n%s\nXXX\n' "$pct" "$label" >&9
+  else
+    printf '%d\n' "$pct" >&9
+  fi
+}
+
+wt_gauge_done() {
+  exec 9>&-                              # close write end → whiptail sees EOF → exits
+  wait "$GAUGE_PID" 2>/dev/null || true
+  rm -f "$_GAUGE_FIFO"
+  GAUGE_PID=""; _GAUGE_FIFO=""
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -205,27 +351,28 @@ pkg_manager() {
   esac
 }
 
-zenity_install_cmd() {
+# whiptail is in the 'newt' package on RPM/Arch/macOS; 'whiptail' on Debian.
+whiptail_install_cmd() {
   case "$1" in
-    apt-get) echo "apt-get install -y zenity"     ;;
-    dnf)     echo "dnf install -y zenity"         ;;
-    yum)     echo "yum install -y zenity"         ;;
-    pacman)  echo "pacman -S --noconfirm zenity"  ;;
-    zypper)  echo "zypper install -y zenity"      ;;
-    brew)    echo "brew install zenity"           ;;
-    *)       echo ""                              ;;
+    apt-get) echo "apt-get install -y whiptail"    ;;
+    dnf)     echo "dnf install -y newt"            ;;
+    yum)     echo "yum install -y newt"            ;;
+    pacman)  echo "pacman -S --noconfirm libnewt"  ;;
+    zypper)  echo "zypper install -y newt"         ;;
+    brew)    echo "brew install newt"              ;;
+    *)       echo ""                               ;;
   esac
 }
 
-zenity_remove_cmd() {
+whiptail_remove_cmd() {
   case "$1" in
-    apt-get) echo "apt-get remove -y zenity"       ;;
-    dnf)     echo "dnf remove -y zenity"           ;;
-    yum)     echo "yum remove -y zenity"           ;;
-    pacman)  echo "pacman -Rs --noconfirm zenity"  ;;
-    zypper)  echo "zypper remove -y zenity"        ;;
-    brew)    echo "brew uninstall zenity"          ;;
-    *)       echo ""                               ;;
+    apt-get) echo "apt-get remove -y whiptail"      ;;
+    dnf)     echo "dnf remove -y newt"              ;;
+    yum)     echo "yum remove -y newt"              ;;
+    pacman)  echo "pacman -Rs --noconfirm libnewt"  ;;
+    zypper)  echo "zypper remove -y newt"           ;;
+    brew)    echo "brew uninstall newt"             ;;
+    *)       echo ""                                ;;
   esac
 }
 
@@ -253,9 +400,9 @@ box "$CYN" "🚀  morganism  bootstrap" \
   "This script will:" \
   "" \
   "${CYN}①${R}  Detect your OS and select the right package manager" \
-  "${CYN}②${R}  Install Zenity (GTK UI helper) + any dependencies" \
+  "${CYN}②${R}  Install whiptail (TUI dialog helper) + any dependencies" \
   "${CYN}③${R}  Clone your selected morganism GitHub repositories" \
-  "${CYN}④${R}  Optionally remove Zenity when done" \
+  "${CYN}④${R}  Optionally remove whiptail when done" \
   "" \
   "${DIM}Log file → ${LOG}${R}" \
   "" \
@@ -278,15 +425,15 @@ printf "\n  ${GRN}✔  Confirmed — proceeding.${R}\n\n" > /dev/tty
 log "Welcome confirmed"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 — ZENITY CLEANUP POLICY (3s, default = retain)
+# STEP 2 — WHIPTAIL CLEANUP POLICY (3s, default = retain)
 # ─────────────────────────────────────────────────────────────────────────────
-box "$MGT" "🧹  Zenity cleanup policy" \
+box "$MGT" "🧹  whiptail cleanup policy" \
   "" \
-  "Zenity (GTK dialog) will be installed as a UI helper." \
+  "whiptail (TUI dialog) will be installed as a UI helper." \
   "Should it be UNINSTALLED when this script finishes?" \
   "" \
-  "${MGT}y${R}  =  remove Zenity after completion" \
-  "${GRN}n${R}  =  keep Zenity  ${DIM}(default — activates after 3 s)${R}" \
+  "${MGT}y${R}  =  remove whiptail after completion" \
+  "${GRN}n${R}  =  keep whiptail  ${DIM}(default — activates after 3 s)${R}" \
   ""
 
 log_section "Step 2 — cleanup policy (3s, default=n)"
@@ -294,28 +441,28 @@ key="$(read_key_timed 3)"
 log_prompt "Cleanup policy → key='${key:-<timeout>}'"
 
 if [[ "${key,,}" == "y" ]]; then
-  CLEANUP_ZENITY=true
-  printf "\n  ${YLW}⚑  Zenity will be removed after completion.${R}\n\n" > /dev/tty
+  CLEANUP_WHIPTAIL=true
+  printf "\n  ${YLW}⚑  whiptail will be removed after completion.${R}\n\n" > /dev/tty
   log "Cleanup policy: REMOVE"
 else
-  CLEANUP_ZENITY=false
-  printf "\n  ${GRN}✔  Zenity will be retained.${R}\n\n" > /dev/tty
+  CLEANUP_WHIPTAIL=false
+  printf "\n  ${GRN}✔  whiptail will be retained.${R}\n\n" > /dev/tty
   log "Cleanup policy: RETAIN"
 fi
 
 sleep 0.6
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — OS DETECTION + ZENITY INSTALL
+# STEP 3 — OS DETECTION + WHIPTAIL INSTALL
 # ─────────────────────────────────────────────────────────────────────────────
-log_section "Step 3 — OS detection + Zenity install"
+log_section "Step 3 — OS detection + whiptail install"
 
 OS="$(detect_os)"
 PM="$(pkg_manager "$OS")"
 SUDO="$(needs_sudo "$OS")"
-INSTALL_CMD="$(zenity_install_cmd "$PM")"
-REMOVE_CMD="$(zenity_remove_cmd "$PM")"
-CLEANUP_LABEL="$( $CLEANUP_ZENITY && echo 'removed after run' || echo 'retained' )"
+INSTALL_CMD="$(whiptail_install_cmd "$PM")"
+REMOVE_CMD="$(whiptail_remove_cmd "$PM")"
+CLEANUP_LABEL="$( $CLEANUP_WHIPTAIL && echo 'removed after run' || echo 'retained' )"
 
 log "OS family       : ${OS}"
 log "Package manager : ${PM}"
@@ -323,24 +470,24 @@ log "Install command : ${SUDO} ${INSTALL_CMD:-N/A}"
 log "Remove command  : ${SUDO} ${REMOVE_CMD:-N/A}"
 log "Cleanup policy  : ${CLEANUP_LABEL}"
 
-command -v zenity &>/dev/null && ZENITY_WAS_PREINSTALLED=true \
-  && log "Zenity already installed: $(command -v zenity)"
+command -v whiptail &>/dev/null && WHIPTAIL_WAS_PREINSTALLED=true \
+  && log "whiptail already installed: $(command -v whiptail)"
 
 box "$BLU" "📦  System setup" \
   "" \
   "OS family       : ${BOLD}${OS}${R}" \
   "Package manager : ${BOLD}${PM}${R}" \
   "Install command : ${DIM}${SUDO} ${INSTALL_CMD:-N/A (OS unknown)}${R}" \
-  "Zenity policy   : ${BOLD}${CLEANUP_LABEL}${R}" \
+  "whiptail policy : ${BOLD}${CLEANUP_LABEL}${R}" \
   "Log file        : ${DIM}${LOG}${R}" \
   ""
 
-if $ZENITY_WAS_PREINSTALLED; then
-  printf "  ${GRN}✔  Zenity already present — skipping install.${R}\n\n" > /dev/tty
+if $WHIPTAIL_WAS_PREINSTALLED; then
+  printf "  ${GRN}✔  whiptail already present — skipping install.${R}\n\n" > /dev/tty
   log "Skipping install"
 else
   if [[ "$PM" == "unknown" || -z "$INSTALL_CMD" ]]; then
-    printf "\n  ${RED}✘  Unrecognised OS / package manager.  Cannot install Zenity.${R}\n" > /dev/tty
+    printf "\n  ${RED}✘  Unrecognised OS / package manager.  Cannot install whiptail.${R}\n" > /dev/tty
     printf "  ${DIM}Log: %s${R}\n\n" "$LOG" > /dev/tty
     log_error "Unknown PM — aborting"
     exit 1
@@ -361,52 +508,37 @@ else
     run_logged "Refreshing package cache" $SUDO apt-get update -qq
   fi
 
-  # Install Zenity
+  # Install whiptail
   log_package "Running: ${SUDO} ${INSTALL_CMD}"
   # shellcheck disable=SC2086
-  if run_logged "Installing zenity" $SUDO $INSTALL_CMD; then
-    log_package "Zenity installation succeeded"
+  if run_logged "Installing whiptail" $SUDO $INSTALL_CMD; then
+    log_package "whiptail installation succeeded"
   else
-    printf "\n  ${RED}✘  Zenity install failed — see log: %s${R}\n" "$LOG" > /dev/tty
-    log_error "Zenity install failed"
+    printf "\n  ${RED}✘  whiptail install failed — see log: %s${R}\n" "$LOG" > /dev/tty
+    log_error "whiptail install failed"
     exit 1
   fi
 fi
 
 # Sanity-check
-if ! command -v zenity &>/dev/null; then
-  printf "\n  ${RED}✘  zenity not found after install attempt. Aborting.${R}\n" > /dev/tty
-  log_error "zenity not available post-install"
+if ! command -v whiptail &>/dev/null; then
+  printf "\n  ${RED}✘  whiptail not found after install attempt. Aborting.${R}\n" > /dev/tty
+  log_error "whiptail not available post-install"
   exit 1
 fi
-log "zenity path: $(command -v zenity)"
+log "whiptail path: $(command -v whiptail)"
 
 ansi_bar "System ready:"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DISPLAY CHECK — Zenity requires a running graphical session.
-# Without $DISPLAY (X11) or $WAYLAND_DISPLAY the process blocks forever.
-# ─────────────────────────────────────────────────────────────────────────────
-if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-  printf "\n  ${RED}${BOLD}✘  No graphical display detected.${R}\n" > /dev/tty
-  printf "  ${DIM}Set DISPLAY (X11) or WAYLAND_DISPLAY before running,\n" > /dev/tty
-  printf "  or run inside a desktop session (not a plain SSH shell).${R}\n\n" > /dev/tty
-  log_error "No DISPLAY or WAYLAND_DISPLAY — cannot open Zenity dialogs"
-  exit 1
-fi
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 — BASE_PATH (Zenity input dialog)
+# STEP 4 — BASE_PATH (whiptail inputbox)
 # ─────────────────────────────────────────────────────────────────────────────
 log_section "Step 4 — BASE_PATH selection"
 
-BASE_PATH="$(zenity \
-  --entry \
-  --title="morganism bootstrap — Source directory" \
-  --text="Base path for cloned repositories:" \
-  --entry-text="${DEFAULT_BASE_PATH}" \
-  --width=520 \
-  2>/dev/null)" || {
+BASE_PATH="$(wt_input \
+  "morganism bootstrap — Source directory" \
+  "Base path for cloned repositories:" \
+  "${DEFAULT_BASE_PATH}")" || {
   log_prompt "BASE_PATH dialog cancelled"
   printf "  ${RED}✘  Cancelled.${R}\n" > /dev/tty
   exit 1
@@ -417,16 +549,14 @@ BASE_PATH="${BASE_PATH/#\~/$HOME}"
 log_prompt "BASE_PATH = ${BASE_PATH}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 5 — FETCH REPO LIST + ZENITY MULTI-SELECT
+# STEP 5 — FETCH REPO LIST + WHIPTAIL CHECKLIST
 # ─────────────────────────────────────────────────────────────────────────────
 log_section "Step 5 — Repository selection"
 log "Fetching repo list: ${REPOS_URL}"
 
 REPOS_RAW="$(curl -fsSL "$REPOS_URL" 2>>"$LOG")" || {
-  zenity --error \
-    --title="Bootstrap — fetch error" \
-    --text="Failed to fetch repository list from:\n${REPOS_URL}\n\nSee log: ${LOG}" \
-    --width=460 2>/dev/null
+  wt_error "Bootstrap — fetch error" \
+    "Failed to fetch repository list from:\n${REPOS_URL}\n\nSee log: ${LOG}"
   log_error "Failed to fetch ${REPOS_URL}"
   exit 1
 }
@@ -434,95 +564,80 @@ REPOS_RAW="$(curl -fsSL "$REPOS_URL" 2>>"$LOG")" || {
 log "Raw repos:"
 printf '%s\n' "$REPOS_RAW" >> "$LOG"
 
-# Build Zenity checklist args (all pre-selected TRUE)
-ZENITY_REPO_ARGS=()
+# Build whiptail checklist args: <tag> <description> <ON|OFF>
+WT_REPO_ARGS=()
 while IFS= read -r repo; do
   repo="$(printf '%s' "$repo" | tr -d '[:space:]')"
   [[ -z "$repo" || "$repo" =~ ^# ]] && continue
-  ZENITY_REPO_ARGS+=(TRUE "$repo")
+  WT_REPO_ARGS+=("$repo" "" "ON")
 done <<< "$REPOS_RAW"
 
-if [[ ${#ZENITY_REPO_ARGS[@]} -eq 0 ]]; then
-  zenity --error \
-    --title="Bootstrap — no repos" \
-    --text="bootstrap.repos appears to be empty.\nURL: ${REPOS_URL}" \
-    --width=460 2>/dev/null
+if [[ ${#WT_REPO_ARGS[@]} -eq 0 ]]; then
+  wt_error "Bootstrap — no repos" \
+    "bootstrap.repos appears to be empty.\nURL: ${REPOS_URL}"
   log_error "Empty repos list"
   exit 1
 fi
 
-SELECTION="$(zenity \
-  --list \
-  --checklist \
-  --title="morganism bootstrap — Repository selection" \
-  --text="Select repositories to clone into:\n<b>${BASE_PATH}</b>\n\nAll pre-selected — untick any you don't want." \
-  --column="✔" \
-  --column="Repository" \
-  --separator="|" \
-  --width=500 \
-  --height=520 \
-  "${ZENITY_REPO_ARGS[@]}" \
-  2>/dev/null)" || {
+SELECTION="$(wt_checklist \
+  "morganism bootstrap — Repository selection" \
+  "Select repositories to clone into:\n${BASE_PATH}\n\nAll pre-selected — untick any you don't want." \
+  "${WT_REPO_ARGS[@]}")" || {
   log_prompt "Repo selection cancelled"
   printf "  ${RED}✘  Cancelled.${R}\n" > /dev/tty
   exit 1
 }
 
-log_prompt "Repo selection: ${SELECTION}"
-IFS='|' read -ra SELECTED_REPOS <<< "$SELECTION"
+log_prompt "Repo selection raw: ${SELECTION}"
+
+# whiptail checklist returns quoted space-separated tokens; strip quotes
+SELECTED_REPOS=()
+for token in $SELECTION; do
+  token="${token//\"/}"
+  [[ -n "$token" ]] && SELECTED_REPOS+=("$token")
+done
 log "Selected: ${SELECTED_REPOS[*]:-<none>}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 6 — CLONE (Zenity progress bar)
+# STEP 6 — CLONE (whiptail gauge progress bar)
 # ─────────────────────────────────────────────────────────────────────────────
 log_section "Step 6 — Cloning repositories"
 
 if [[ ${#SELECTED_REPOS[@]} -eq 0 ]]; then
-  zenity --warning \
-    --title="morganism bootstrap — Nothing to do" \
-    --text="No repositories were selected.\n\nExiting." \
-    --width=400 2>/dev/null
+  wt_msg "morganism bootstrap — Nothing to do" \
+    "No repositories were selected.\n\nExiting."
   log_warn "No repos selected"
 else
   mkdir -p "$BASE_PATH"
   log_file "$BASE_PATH (base directory)"
 
   total="${#SELECTED_REPOS[@]}"
+  wt_gauge_start "morganism bootstrap — Cloning" "Initialising…"
 
-  (
-    idx=0
-    for repo in "${SELECTED_REPOS[@]}"; do
-      (( idx++ ))
-      pct=$(( idx * 100 / total ))
-      dest="${BASE_PATH}/${repo}"
-      printf '# Cloning %s  (%d / %d)…\n' "$repo" "$idx" "$total"
+  idx=0
+  for repo in "${SELECTED_REPOS[@]}"; do
+    (( idx++ )) || true
+    pct=$(( idx * 100 / total ))
+    dest="${BASE_PATH}/${repo}"
 
-      if [[ -d "${dest}/.git" ]]; then
-        printf '# %s: exists — pulling\n' "$repo"
-        log_clone "PULL  ${dest}"
-        git -C "$dest" pull >> "$LOG" 2>&1 \
-          && log_clone "PULL OK  ${dest}" \
-          || log_warn  "PULL failed ${dest}"
-      else
-        log_clone "CLONE https://github.com/morganism/${repo}.git → ${dest}"
-        git clone "https://github.com/morganism/${repo}.git" "$dest" >> "$LOG" 2>&1 \
-          && log_clone "CLONE OK  ${dest}" \
-          || log_warn  "CLONE failed ${dest}"
-        log_file "$dest"
-      fi
+    wt_gauge_update "$pct" "Cloning ${repo}  (${idx} / ${total})…"
 
-      printf '%d\n' "$pct"
-    done
-    printf '100\n'
-    printf '# All done.\n'
-  ) | zenity \
-    --progress \
-    --title="morganism bootstrap — Cloning" \
-    --text="Initialising…" \
-    --percentage=0 \
-    --auto-close \
-    --width=520 \
-    2>/dev/null || true
+    if [[ -d "${dest}/.git" ]]; then
+      log_clone "PULL  ${dest}"
+      git -C "$dest" pull >> "$LOG" 2>&1 \
+        && log_clone "PULL OK  ${dest}" \
+        || log_warn  "PULL failed ${dest}"
+    else
+      log_clone "CLONE https://github.com/morganism/${repo}.git → ${dest}"
+      git clone "https://github.com/morganism/${repo}.git" "$dest" >> "$LOG" 2>&1 \
+        && log_clone "CLONE OK  ${dest}" \
+        || log_warn  "CLONE failed ${dest}"
+      log_file "$dest"
+    fi
+  done
+
+  wt_gauge_update 100 "All done."
+  wt_gauge_done
 
   for repo in "${SELECTED_REPOS[@]}"; do
     dest="${BASE_PATH}/${repo}"
@@ -536,18 +651,18 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 7 — CLEANUP ZENITY (if requested and we installed it)
+# STEP 7 — CLEANUP WHIPTAIL (if requested and we installed it)
 # ─────────────────────────────────────────────────────────────────────────────
 log_section "Step 7 — post-run cleanup"
 
-if $CLEANUP_ZENITY && ! $ZENITY_WAS_PREINSTALLED && [[ -n "$REMOVE_CMD" ]]; then
-  log_package "Removing Zenity: ${SUDO} ${REMOVE_CMD}"
+if $CLEANUP_WHIPTAIL && ! $WHIPTAIL_WAS_PREINSTALLED && [[ -n "$REMOVE_CMD" ]]; then
+  log_package "Removing whiptail: ${SUDO} ${REMOVE_CMD}"
   # shellcheck disable=SC2086
   $SUDO $REMOVE_CMD >> "$LOG" 2>&1 \
-    && log_package "Zenity removed" \
-    || log_warn "Zenity removal failed (see log)"
+    && log_package "whiptail removed" \
+    || log_warn "whiptail removal failed (see log)"
 else
-  log "Zenity retained"
+  log "whiptail retained"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -555,45 +670,39 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 log_section "Step 8 — summary"
 
-cleanup_str="$( $CLEANUP_ZENITY && ! $ZENITY_WAS_PREINSTALLED \
+cleanup_str="$( $CLEANUP_WHIPTAIL && ! $WHIPTAIL_WAS_PREINSTALLED \
   && echo 'Removed ✔' || echo 'Retained' )"
 
-# Zenity summary (Pango markup)
-cloned_pango=""
-for r in "${CLONED_REPOS[@]+"${CLONED_REPOS[@]}"}"; do cloned_pango+="  ✔ ${r}\n"; done
-[[ -z "$cloned_pango" ]] && cloned_pango="  (none)\n"
+# whiptail summary msgbox
+summary_wt="morganism bootstrap — complete\n\n"
+summary_wt+="Base path : ${BASE_PATH}\n"
+summary_wt+="Log file  : ${LOG}\n\n"
+summary_wt+="Cloned:\n"
+for r in "${CLONED_REPOS[@]+"${CLONED_REPOS[@]}"}"; do summary_wt+="  ✔  ${r}\n"; done
+[[ ${#CLONED_REPOS[@]} -eq 0 ]] && summary_wt+="  (none)\n"
+if [[ ${#FAILED_REPOS[@]} -gt 0 ]]; then
+  summary_wt+="\nFailed:\n"
+  for r in "${FAILED_REPOS[@]}"; do summary_wt+="  ✘  ${r}\n"; done
+fi
+summary_wt+="\nwhiptail : ${cleanup_str}"
 
-failed_pango=""
-for r in "${FAILED_REPOS[@]+"${FAILED_REPOS[@]}"}"; do failed_pango+="  ✘ ${r}\n"; done
-
-summary_pango="<b>morganism bootstrap — complete</b>\n\n"
-summary_pango+="<b>Base path:</b>  ${BASE_PATH}\n"
-summary_pango+="<b>Log file:</b>   ${LOG}\n\n"
-summary_pango+="<b>Cloned:</b>\n${cloned_pango}"
-[[ -n "$failed_pango" ]] && summary_pango+="\n<b>Failed:</b>\n${failed_pango}"
-summary_pango+="\n<b>Zenity:</b>  ${cleanup_str}\n"
-
-log "Summary — cloned  : ${CLONED_REPOS[*]:-none}"
-log "Summary — failed  : ${FAILED_REPOS[*]:-none}"
-log "Summary — zenity  : ${cleanup_str}"
+log "Summary — cloned   : ${CLONED_REPOS[*]:-none}"
+log "Summary — failed   : ${FAILED_REPOS[*]:-none}"
+log "Summary — whiptail : ${cleanup_str}"
 log "Bootstrap complete"
 
-command -v zenity &>/dev/null && \
-  zenity --info \
-    --title="morganism bootstrap — Done" \
-    --text="${summary_pango}" \
-    --width=500 2>/dev/null || true
+command -v whiptail &>/dev/null && wt_msg "morganism bootstrap — Done" "$summary_wt" || true
 
-# Terminal summary (always shown)
+# Terminal summary box (always shown, no whiptail dependency)
 printf '\n' > /dev/tty
 box "$GRN" "✔  Bootstrap complete" \
   "" \
-  "Base path : ${BASE_PATH}" \
-  "Log file  : ${LOG}" \
+  "Base path  : ${BASE_PATH}" \
+  "Log file   : ${LOG}" \
   "" \
-  "Cloned    : ${CLONED_REPOS[*]:-none}" \
-  "Failed    : ${FAILED_REPOS[*]:-none}" \
-  "Zenity    : ${cleanup_str}" \
+  "Cloned     : ${CLONED_REPOS[*]:-none}" \
+  "Failed     : ${FAILED_REPOS[*]:-none}" \
+  "whiptail   : ${cleanup_str}" \
   ""
 printf "  ${DIM}Full log → ${YLW}%s${R}\n\n" "$LOG" > /dev/tty
 
