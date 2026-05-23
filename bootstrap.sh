@@ -239,47 +239,106 @@ ansi_bar() {
 # ─────────────────────────────────────────────────────────────────────────────
 # WHIPTAIL WRAPPERS
 #
-# whiptail is part of the 'newt' package — a lightweight ncurses TUI library.
-# It reads and writes /dev/tty directly, so:
-#   • No DISPLAY or Wayland socket required
-#   • Works over SSH
-#   • Works in curl|bash pipelines
+# whiptail (newt) reads/writes /dev/tty directly — no DISPLAY needed.
 #
-# All dialogs use the fd-swap trick (3>&1 1>&2 2>&3) to capture whiptail's
-# output (written to stderr) into the variable while letting its UI use stdout.
+# ── Colour theming ────────────────────────────────────────────────────────────
+# NEWT_COLORS controls every palette element.  Without it, macOS's brew newt
+# renders the inputbox text area with a bright-green background (unreadable).
+# We set a clean dark theme matching the script's ANSI palette.
+#
+# ── Output capture without fd-swap ───────────────────────────────────────────
+# The classic "3>&1 1>&2 2>&3" fd-swap trick breaks inside $() subshells on
+# macOS: whiptail opens /dev/tty for its UI but the subshell's stdout is a
+# pipe, so the swap misdirects the UI draw — whiptail gets no keypresses,
+# immediately returns cancel (rc=1), and the calling $() captures nothing.
+#
+# Fix: write the result to a private temp file, run whiptail directly (not in
+# a subshell), read the temp file afterward.  The temp file is created in _wt()
+# and cleaned up by each wrapper after reading.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Shared dark theme — matches the ANSI cyan/blue/green palette of this script.
+# Format: element=foreground,background  (newt colour names)
+export NEWT_COLORS='
+root=white,black
+border=cyan,black
+window=white,black
+shadow=black,black
+title=cyan,black
+button=black,yellow
+actbutton=black,cyan
+compactbutton=black,yellow
+checkbox=white,black
+actcheckbox=black,cyan
+entry=white,black
+disentry=white,black
+label=white,black
+listbox=white,black
+actlistbox=black,cyan
+sellistbox=black,green
+actsellistbox=black,cyan
+textbox=white,black
+acttextbox=black,cyan
+helpline=black,yellow
+roottext=white,black
+emptyscale=white,black
+fullscale=black,cyan
+disabledentry=white,black
+'
+
+# Temp file for capturing whiptail output (avoids the $() subshell fd problem)
+_WT_TMP=""
+
+# _wt_open — create the temp file; called at the top of every dialog wrapper
+_wt_open()  { _WT_TMP="$(mktemp /tmp/_wt_out_XXXXXX)"; }
+
+# _wt_read — read the temp file content to stdout, then delete it
+_wt_read()  { cat "$_WT_TMP"; rm -f "$_WT_TMP"; _WT_TMP=""; }
+
+# _wt_clean — delete temp file without reading (used on cancel paths)
+_wt_clean() { rm -f "$_WT_TMP"; _WT_TMP=""; }
+
 # wt_input <title> <prompt> <default>
-# Prints the entered string to stdout; exits non-zero on Cancel.
+# Sets _WT_RESULT and returns 0 (Ok) or 1 (Cancel).
+# Caller reads result from _WT_RESULT, not stdout, to avoid any subshell.
+_WT_RESULT=""
 wt_input() {
+  _wt_open
   whiptail --title "$1" \
            --inputbox "$2" \
            12 72 "$3" \
-           3>&1 1>&2 2>&3
+           2>"$_WT_TMP" </dev/tty >/dev/tty
+  local rc=$?
+  _WT_RESULT="$(_wt_read)"
+  return $rc
 }
 
 # wt_checklist <title> <prompt> <tag> <desc> <status> [...]
-# Prints space-separated quoted selections to stdout; exits non-zero on Cancel.
+# Sets _WT_RESULT; returns 0 (Ok) or 1 (Cancel).
 wt_checklist() {
   local title="$1" prompt="$2"; shift 2
   local n_items=$(( $# / 3 ))
   local height=$(( n_items + 10 ))
   [[ $height -gt 35 ]] && height=35
+  _wt_open
   whiptail --title "$title" \
            --checklist "$prompt" \
            "$height" 72 "$n_items" \
            "$@" \
-           3>&1 1>&2 2>&3
+           2>"$_WT_TMP" </dev/tty >/dev/tty
+  local rc=$?
+  _WT_RESULT="$(_wt_read)"
+  return $rc
 }
 
-# wt_msg <title> <text>  — informational OK-dismissable message box
+# wt_msg <title> <text>  — OK-dismissable message box (no result value)
 wt_msg() {
-  whiptail --title "$1" --msgbox "$2" 20 72 3>&1 1>&2 2>&3
+  whiptail --title "$1" --msgbox "$2" 20 72 </dev/tty >/dev/tty
 }
 
 # wt_error <title> <text>  — error message box
 wt_error() {
-  whiptail --title "✘  $1" --msgbox "$2" 12 72 3>&1 1>&2 2>&3
+  whiptail --title "✘  $1" --msgbox "$2" 12 72 </dev/tty >/dev/tty
 }
 
 # ── gauge (progress bar) ─────────────────────────────────────────────────────
@@ -535,14 +594,15 @@ ansi_bar "System ready:"
 # ─────────────────────────────────────────────────────────────────────────────
 log_section "Step 4 — BASE_PATH selection"
 
-BASE_PATH="$(wt_input \
+wt_input \
   "morganism bootstrap — Source directory" \
   "Base path for cloned repositories:" \
-  "${DEFAULT_BASE_PATH}")" || {
+  "${DEFAULT_BASE_PATH}" || {
   log_prompt "BASE_PATH dialog cancelled"
   printf "  ${RED}✘  Cancelled.${R}\n" > /dev/tty
   exit 1
 }
+BASE_PATH="$_WT_RESULT"
 
 BASE_PATH="${BASE_PATH/#\~/$HOME}"
 [[ -z "$BASE_PATH" ]] && BASE_PATH="$DEFAULT_BASE_PATH"
@@ -579,14 +639,15 @@ if [[ ${#WT_REPO_ARGS[@]} -eq 0 ]]; then
   exit 1
 fi
 
-SELECTION="$(wt_checklist \
+wt_checklist \
   "morganism bootstrap — Repository selection" \
   "Select repositories to clone into:\n${BASE_PATH}\n\nAll pre-selected — untick any you don't want." \
-  "${WT_REPO_ARGS[@]}")" || {
+  "${WT_REPO_ARGS[@]}" || {
   log_prompt "Repo selection cancelled"
   printf "  ${RED}✘  Cancelled.${R}\n" > /dev/tty
   exit 1
 }
+SELECTION="$_WT_RESULT"
 
 log_prompt "Repo selection raw: ${SELECTION}"
 
