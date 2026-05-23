@@ -1,37 +1,579 @@
 #!/usr/bin/env bash
 : <<DOCXX
-Add description
-Author: morgan@morganism.dev
-Date: Sat 18 Apr 2026 17:20:40 BST
+bootstrap.sh — morganism init bootstrap
+════════════════════════════════════════════════════════════════
+Bootstraps a new machine by:
+  • Detecting OS and selecting the right package manager
+  • Installing Zenity (GTK dialog helper) and dependencies
+  • Prompting (via Zenity) for a base path and repo selection
+  • Cloning selected morganism GitHub repositories
+  • Optionally removing Zenity after completion
+  • Logging every action, prompt answer, package and file path
 
-This script is intended to be run when it resides on the local file system as well as remotely,
-curl -fsSL https://raw.githubusercontent.com/morganism/init/refs/heads/master/bootstrap.sh | bash
-so it needs to know if it is alone or not and take inventory of the system on which it is running
-in order to ensure ensure all dependencies are satisfied and determine operational mode.
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/morganism/init/refs/heads/master/bootstrap.sh | bash
 
-The operational mode should be determined by this script and based on current state at any given time.
-This script must bei able run idempotently such that it can be killed and restarted safely and proceed 
-deterministically as a finite state automaton.
-
-** A [potentially] infinite loop that checks a message queue for instruction about what to do next, and
-ALWAYS performs a seris of "core" tasks such as: CHECK_QUEUE (CONSUME), GET_TASK_FROM_QUEUE, EXECUTE_TASK, 
-RESASSESS_PROGRESS, PUT_TASK_ON_QUEUE (PRODUCE), LOGGING, HOUSEKEEPING (ensure state data, check dependencies, 
-organise queued tasks, determine current state, etc ... ) 
-
-That is the ideal tool. Simplify.
-	
-
-you can see why state machine is needed, when i re-call bootstrap.sh it needs to 
-be able to "take over" from the calling bootstrap.
-determine if git repo checked out or not yet
-make temp dir and cd
-curl -L https://github.com/morganism/init/archive/refs/tags/latest.tar.gz | tar -xz
-cd init-latest
-call real bootstrap.sh
-
-
-
+Log: /tmp/bootstrap_<YYYYMMDD_HHMMSS>.log
 DOCXX
 
+# ─────────────────────────────────────────────────────────────────────────────
+# STRICT MODE  (set -e omitted intentionally — we handle errors explicitly
+# so interactive stages don't abort on non-zero read timeouts etc.)
+# ─────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
 
-echo "Hello world."
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBALS
+# ─────────────────────────────────────────────────────────────────────────────
+readonly TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+readonly LOG="/tmp/bootstrap_${TIMESTAMP}.log"
+readonly REPOS_URL="https://raw.githubusercontent.com/morganism/init/refs/heads/master/bootstrap.repos"
+readonly DEFAULT_BASE_PATH="${HOME}/src/morganism"
+CLEANUP_ZENITY=false
+ZENITY_WAS_PREINSTALLED=false
+BASE_PATH=""
+declare -a SELECTED_REPOS=()
+declare -a CLONED_REPOS=()
+declare -a FAILED_REPOS=()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANSI PALETTE
+# ─────────────────────────────────────────────────────────────────────────────
+R=$'\033[0m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+RED=$'\033[1;31m'
+GRN=$'\033[1;32m'
+YLW=$'\033[1;33m'
+BLU=$'\033[1;34m'
+MGT=$'\033[1;35m'
+CYN=$'\033[1;36m'
+WHT=$'\033[1;37m'
+BRED=$'\033[1;41m'    # bright red background
+BGRN=$'\033[1;42m'   # bright green background
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+_log()          { printf '[%s] %s\n'       "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+log()           { _log        "$*"; }
+log_section()   { printf '\n%s\n  %s\n%s\n' \
+                  "$(printf '═%.0s' {1..60})" \
+                  "$*" \
+                  "$(printf '═%.0s' {1..60})" >> "$LOG"; }
+log_prompt()    { _log "[PROMPT]  $*"; }
+log_package()   { _log "[PACKAGE] $*"; }
+log_file()      { _log "[FILE]    $*"; }
+log_clone()     { _log "[CLONE]   $*"; }
+log_warn()      { _log "[WARN]    $*"; }
+log_error()     { _log "[ERROR]   $*"; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TERMINAL HELPERS
+# (all output to /dev/tty so it reaches the terminal even in curl|bash pipes)
+# ─────────────────────────────────────────────────────────────────────────────
+tty_print() { printf '%b\n' "$@" > /dev/tty; }
+tty_printf() { printf '%b'  "$@" > /dev/tty; }
+
+# Draw a Unicode box, colour-coded, with multiple body lines
+# Usage: box <colour> <title> [line ...]
+box() {
+  local col="$1" title="$2"; shift 2
+  local W=62
+  local bar; bar="$(printf '═%.0s' $(seq 1 $W))"
+  tty_print "${col}╔${bar}╗${R}"
+  tty_printf "${col}║${R} ${BOLD}${col}%-*s${R} ${col}║${R}\n" "$((W-2))" "  ${title}"
+  tty_print "${col}╠${bar}╣${R}"
+  for line in "$@"; do
+    tty_printf "${col}║${R}  %-*b${col}║${R}\n" "$((W-2))" "${line}"
+  done
+  tty_print "${col}╚${bar}╝${R}"
+}
+
+# Spinner while a background command runs — all command output goes to log
+# Usage: run_logged <label> <cmd> [args...]
+run_logged() {
+  local label="$1"; shift
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local i=0 rc=0
+  "$@" >> "$LOG" 2>&1 &
+  local pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    tty_printf "\r  ${CYN}%s${R}  %s  " "${frames[$((i % 10))]}" "$label"
+    (( i++ )) || true
+    sleep 0.12
+  done
+  wait "$pid" && rc=$? || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    tty_printf "\r  ${GRN}✔${R}  %-55s\n" "$label"
+  else
+    tty_printf "\r  ${RED}✘${R}  %-55s (rc=${rc})\n" "$label"
+  fi
+  return $rc
+}
+
+# Timed single-keypress from /dev/tty with live countdown
+# Usage: key=$(read_key_timed <seconds>)
+read_key_timed() {
+  local timeout="$1"
+  local key=""
+  for (( i=timeout; i>0; i-- )); do
+    tty_printf "\r  ${YLW}⏱  %2ds remaining${R}  " "$i"
+    if read -t 1 -n 1 -s key < /dev/tty 2>/dev/null; then
+      break
+    fi
+  done
+  # clear countdown line
+  tty_printf "\r%80s\r" ""
+  printf '%s' "$key"
+}
+
+# ANSI progress bar (fake fill for visual feedback)
+ansi_bar() {
+  local label="${1:-}" width=44
+  tty_printf "\n  ${CYN}%-18s${R} [" "$label"
+  for (( i=0; i<width; i++ )); do
+    tty_printf "${GRN}█${R}"
+    sleep 0.025
+  done
+  tty_printf "] ${GRN}${BOLD}100%%${R}\n\n"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OS / PACKAGE-MANAGER DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+detect_os() {
+  if [[ "${OSTYPE:-}" == darwin* ]]; then echo "macos"; return; fi
+  if [[ -f /etc/os-release ]]; then
+    local id
+    id=$(. /etc/os-release && echo "${ID:-unknown}" | tr '[:upper:]' '[:lower:]')
+    case "$id" in
+      ubuntu|debian|linuxmint|pop|raspbian|kali) echo "debian" ;;
+      fedora|rhel|centos|rocky|almalinux)        echo "rhel"   ;;
+      arch|manjaro|endeavouros|garuda)            echo "arch"   ;;
+      opensuse*|suse|tumbleweed)                  echo "suse"   ;;
+      *)                                          echo "unknown";;
+    esac
+  else
+    echo "unknown"
+  fi
+}
+
+pkg_manager() {
+  case "$1" in
+    debian) echo "apt-get" ;;
+    rhel)   command -v dnf &>/dev/null && echo "dnf" || echo "yum" ;;
+    arch)   echo "pacman"  ;;
+    suse)   echo "zypper"  ;;
+    macos)  echo "brew"    ;;
+    *)      echo "unknown" ;;
+  esac
+}
+
+zenity_install_cmd() {
+  case "$1" in
+    apt-get) echo "apt-get install -y zenity"        ;;
+    dnf)     echo "dnf install -y zenity"            ;;
+    yum)     echo "yum install -y zenity"            ;;
+    pacman)  echo "pacman -S --noconfirm zenity"     ;;
+    zypper)  echo "zypper install -y zenity"         ;;
+    brew)    echo "brew install zenity"              ;;
+    *)       echo ""                                 ;;
+  esac
+}
+
+zenity_remove_cmd() {
+  case "$1" in
+    apt-get) echo "apt-get remove -y zenity"         ;;
+    dnf)     echo "dnf remove -y zenity"             ;;
+    yum)     echo "yum remove -y zenity"             ;;
+    pacman)  echo "pacman -Rs --noconfirm zenity"    ;;
+    zypper)  echo "zypper remove -y zenity"          ;;
+    brew)    echo "brew uninstall zenity"            ;;
+    *)       echo ""                                 ;;
+  esac
+}
+
+needs_sudo() { [[ $EUID -ne 0 && "$1" != "macos" ]] && echo "sudo" || echo ""; }
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SCRIPT START
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Initialise log
+touch "$LOG"
+log_section "bootstrap.sh started"
+log "Log          : ${LOG}"
+log "Invocation   : curl -fsSL ... | bash"
+log "User         : ${USER:-$(id -un)}"
+log "Hostname     : $(hostname)"
+log "Kernel       : $(uname -a)"
+log "Date         : $(date)"
+
+clear > /dev/tty
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — WELCOME + 10-SECOND CONFIRM
+# ─────────────────────────────────────────────────────────────────────────────
+box "$CYN" "🚀  morganism  bootstrap" \
+  "" \
+  "  This script will:" \
+  "" \
+  "  ${CYN}①${R}  Detect your OS and select the right package manager" \
+  "  ${CYN}②${R}  Install Zenity (GTK UI helper) + any dependencies" \
+  "  ${CYN}③${R}  Clone your selected morganism GitHub repositories" \
+  "  ${CYN}④${R}  Optionally remove Zenity when done" \
+  "" \
+  "  ${DIM}Log file → ${LOG}${R}" \
+  "" \
+  "  ${YLW}Press  y  within 10 seconds to continue.${R}" \
+  "  ${DIM}Any other key or timeout → ABORT${R}" \
+  ""
+
+log_section "Step 1 — welcome prompt (10s)"
+
+key="$(read_key_timed 10)"
+log_prompt "Welcome → key='${key:-<timeout>}'"
+
+if [[ "${key,,}" != "y" ]]; then
+  tty_print "\n  ${RED}${BOLD}✘  Aborted.${R}  (input: '${key:-<timeout>}')"
+  tty_print "  ${DIM}Log: ${LOG}${R}\n"
+  log_error "Aborted at welcome prompt"
+  exit 1
+fi
+
+tty_print "\n  ${GRN}✔  Confirmed — proceeding.${R}\n"
+log "Welcome confirmed"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — ZENITY CLEANUP POLICY (3-second prompt, default N)
+# ─────────────────────────────────────────────────────────────────────────────
+box "$MGT" "🧹  Zenity cleanup policy" \
+  "" \
+  "  Zenity (GTK dialog) will be installed as a UI helper." \
+  "  Should it be UNINSTALLED when this script finishes?" \
+  "" \
+  "  ${MGT}y${R} = remove Zenity after completion" \
+  "  ${GRN}n${R} = keep Zenity  ${DIM}(default — activates after 3 s)${R}" \
+  ""
+
+log_section "Step 2 — cleanup policy (3s, default=n)"
+
+key="$(read_key_timed 3)"
+log_prompt "Cleanup policy → key='${key:-<timeout>}'"
+
+if [[ "${key,,}" == "y" ]]; then
+  CLEANUP_ZENITY=true
+  tty_print "\n  ${YLW}⚑  Zenity will be removed after completion.${R}\n"
+  log "Cleanup policy: REMOVE"
+else
+  CLEANUP_ZENITY=false
+  tty_print "\n  ${GRN}✔  Zenity will be retained.${R}\n"
+  log "Cleanup policy: RETAIN"
+fi
+
+sleep 0.6
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — OS DETECTION + ZENITY INSTALL + ANSI PROGRESS
+# ─────────────────────────────────────────────────────────────────────────────
+log_section "Step 3 — OS detection + Zenity install"
+
+OS="$(detect_os)"
+PM="$(pkg_manager "$OS")"
+SUDO="$(needs_sudo "$OS")"
+INSTALL_CMD="$(zenity_install_cmd "$PM")"
+REMOVE_CMD="$(zenity_remove_cmd "$PM")"
+CLEANUP_LABEL="$( $CLEANUP_ZENITY && echo 'removed after run' || echo 'retained' )"
+
+log "OS family       : ${OS}"
+log "Package manager : ${PM}"
+log "Install command : ${SUDO} ${INSTALL_CMD:-N/A}"
+log "Remove command  : ${SUDO} ${REMOVE_CMD:-N/A}"
+log "Cleanup policy  : ${CLEANUP_LABEL}"
+
+# Check pre-existing Zenity
+if command -v zenity &>/dev/null; then
+  ZENITY_WAS_PREINSTALLED=true
+  log "Zenity already installed at: $(command -v zenity)"
+fi
+
+box "$BLU" "📦  System setup" \
+  "" \
+  "  OS family       : ${BOLD}${OS}${R}" \
+  "  Package manager : ${BOLD}${PM}${R}" \
+  "  Install command : ${DIM}${SUDO} ${INSTALL_CMD:-N/A (OS unknown)}${R}" \
+  "  Zenity policy   : ${BOLD}${CLEANUP_LABEL}${R}" \
+  "  Log file        : ${DIM}${LOG}${R}" \
+  ""
+
+if $ZENITY_WAS_PREINSTALLED; then
+  tty_print "  ${GRN}✔  Zenity already present — skipping install.${R}\n"
+  log "Skipping install"
+else
+  if [[ "$PM" == "unknown" || -z "$INSTALL_CMD" ]]; then
+    tty_print "\n  ${RED}✘  Unrecognised OS / package manager.  Cannot install Zenity.${R}"
+    tty_print "  ${DIM}Log: ${LOG}${R}\n"
+    log_error "Unknown PM — aborting"
+    exit 1
+  fi
+
+  # macOS: bootstrap Homebrew if absent
+  if [[ "$OS" == "macos" ]] && ! command -v brew &>/dev/null; then
+    tty_print "  ${YLW}→  Homebrew not found — installing…${R}\n"
+    log_package "Installing Homebrew"
+    run_logged "Installing Homebrew" \
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    log_package "Homebrew installed"
+  fi
+
+  # Debian: refresh cache
+  if [[ "$PM" == "apt-get" ]]; then
+    log_package "apt-get update"
+    run_logged "Refreshing package cache" \
+      $SUDO apt-get update -qq
+  fi
+
+  # Install Zenity
+  log_package "Running: ${SUDO} ${INSTALL_CMD}"
+  # shellcheck disable=SC2086
+  if run_logged "Installing zenity" $SUDO $INSTALL_CMD; then
+    log_package "Zenity installation succeeded"
+  else
+    tty_print "\n  ${RED}✘  Zenity install failed.  Check log: ${LOG}${R}\n"
+    log_error "Zenity install failed"
+    exit 1
+  fi
+fi
+
+# Sanity-check
+if ! command -v zenity &>/dev/null; then
+  tty_print "\n  ${RED}✘  zenity not found after install. Aborting.${R}\n"
+  log_error "zenity not available post-install"
+  exit 1
+fi
+log "zenity path: $(command -v zenity)"
+
+# Visual progress bar flourish
+ansi_bar "System ready:"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — BASE_PATH (Zenity input dialog)
+# ─────────────────────────────────────────────────────────────────────────────
+log_section "Step 4 — BASE_PATH selection"
+
+BASE_PATH=$(zenity \
+  --entry \
+  --title="morganism bootstrap — Source directory" \
+  --text="Base path for cloned repositories:" \
+  --entry-text="${DEFAULT_BASE_PATH}" \
+  --width=520 \
+  2>/dev/null) || {
+  log_prompt "BASE_PATH dialog cancelled"
+  tty_print "  ${RED}✘  Cancelled.${R}\n"
+  exit 1
+}
+
+# Expand leading tilde
+BASE_PATH="${BASE_PATH/#\~/$HOME}"
+[[ -z "$BASE_PATH" ]] && BASE_PATH="$DEFAULT_BASE_PATH"
+
+log_prompt "BASE_PATH = ${BASE_PATH}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 — FETCH REPO LIST + ZENITY MULTI-SELECT
+# ─────────────────────────────────────────────────────────────────────────────
+log_section "Step 5 — Repository selection"
+log "Fetching repo list from: ${REPOS_URL}"
+
+REPOS_RAW="$(curl -fsSL "$REPOS_URL" 2>>"$LOG")" || {
+  zenity --error \
+    --title="Bootstrap — fetch error" \
+    --text="Failed to fetch repository list from:\n${REPOS_URL}\n\nSee log: ${LOG}" \
+    --width=460 2>/dev/null
+  log_error "Failed to fetch ${REPOS_URL}"
+  exit 1
+}
+
+log "Raw repos list:"
+echo "$REPOS_RAW" >> "$LOG"
+
+# Build Zenity checklist args  (TRUE = pre-selected, all on by default)
+ZENITY_REPO_ARGS=()
+while IFS= read -r repo; do
+  repo="$(echo "$repo" | tr -d '[:space:]')"
+  [[ -z "$repo" || "$repo" =~ ^# ]] && continue
+  ZENITY_REPO_ARGS+=(TRUE "$repo")
+done <<< "$REPOS_RAW"
+
+if [[ ${#ZENITY_REPO_ARGS[@]} -eq 0 ]]; then
+  zenity --error \
+    --title="Bootstrap — no repos" \
+    --text="bootstrap.repos file appears to be empty.\nURL: ${REPOS_URL}" \
+    --width=460 2>/dev/null
+  log_error "Empty repos list"
+  exit 1
+fi
+
+SELECTION="$(zenity \
+  --list \
+  --checklist \
+  --title="morganism bootstrap — Repository selection" \
+  --text="Select repositories to clone into:\n<b>${BASE_PATH}</b>\n\nAll are pre-selected — untick any you don't want." \
+  --column="✔" \
+  --column="Repository" \
+  --separator="|" \
+  --width=500 \
+  --height=520 \
+  "${ZENITY_REPO_ARGS[@]}" \
+  2>/dev/null)" || {
+  log_prompt "Repo selection cancelled"
+  tty_print "  ${RED}✘  Cancelled.${R}\n"
+  exit 1
+}
+
+log_prompt "Repo selection raw: ${SELECTION}"
+
+IFS='|' read -ra SELECTED_REPOS <<< "$SELECTION"
+log "Selected repos: ${SELECTED_REPOS[*]:-<none>}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 — CLONE (Zenity progress bar)
+# ─────────────────────────────────────────────────────────────────────────────
+log_section "Step 6 — Cloning repositories"
+
+if [[ ${#SELECTED_REPOS[@]} -eq 0 ]]; then
+  zenity --warning \
+    --title="morganism bootstrap — Nothing to do" \
+    --text="No repositories were selected.\n\nExiting." \
+    --width=400 2>/dev/null
+  log_warn "No repos selected — nothing to clone"
+else
+  mkdir -p "$BASE_PATH"
+  log_file "$BASE_PATH (base directory created)"
+
+  total="${#SELECTED_REPOS[@]}"
+
+  (
+    idx=0
+    for repo in "${SELECTED_REPOS[@]}"; do
+      (( idx++ ))
+      pct=$(( idx * 100 / total ))
+      dest="${BASE_PATH}/${repo}"
+      echo "# Cloning ${repo}  (${idx} / ${total})…"
+
+      if [[ -d "${dest}/.git" ]]; then
+        echo "# ${repo}: already exists — pulling latest"
+        log_clone "PULL  ${dest}"
+        git -C "$dest" pull >> "$LOG" 2>&1 \
+          && log_clone "PULL OK  ${dest}" \
+          || log_warn  "PULL failed ${dest}"
+      else
+        log_clone "CLONE https://github.com/morganism/${repo}.git → ${dest}"
+        git clone "https://github.com/morganism/${repo}.git" "$dest" >> "$LOG" 2>&1 \
+          && log_clone "CLONE OK  ${dest}" \
+          || log_warn  "CLONE failed ${dest}"
+        log_file "$dest"
+      fi
+
+      echo "$pct"
+    done
+
+    echo "100"
+    echo "# Done."
+  ) | zenity \
+    --progress \
+    --title="morganism bootstrap — Cloning repositories" \
+    --text="Initialising…" \
+    --percentage=0 \
+    --auto-close \
+    --width=520 \
+    2>/dev/null || true
+
+  # Assess what landed
+  for repo in "${SELECTED_REPOS[@]}"; do
+    dest="${BASE_PATH}/${repo}"
+    if [[ -d "${dest}/.git" ]]; then
+      CLONED_REPOS+=("$repo")
+    else
+      FAILED_REPOS+=("$repo")
+    fi
+  done
+
+  log "Confirmed cloned : ${CLONED_REPOS[*]:-none}"
+  log "Failed           : ${FAILED_REPOS[*]:-none}"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7 — CLEANUP ZENITY (if requested and we installed it)
+# ─────────────────────────────────────────────────────────────────────────────
+log_section "Step 7 — post-run cleanup"
+
+if $CLEANUP_ZENITY && ! $ZENITY_WAS_PREINSTALLED && [[ -n "$REMOVE_CMD" ]]; then
+  log_package "Removing Zenity: ${SUDO} ${REMOVE_CMD}"
+  # shellcheck disable=SC2086
+  if $SUDO $REMOVE_CMD >> "$LOG" 2>&1; then
+    log_package "Zenity removed"
+  else
+    log_warn "Zenity removal failed (see log)"
+  fi
+else
+  log "Zenity retained (either pre-installed, cleanup=false, or no remove cmd)"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8 — SUMMARY
+# ─────────────────────────────────────────────────────────────────────────────
+log_section "Step 8 — summary"
+
+cleanup_str="$( $CLEANUP_ZENITY && ! $ZENITY_WAS_PREINSTALLED \
+  && echo "Removed ✔" || echo "Retained" )"
+
+# Build summary strings
+cloned_text=""
+if [[ ${#CLONED_REPOS[@]} -gt 0 ]]; then
+  for r in "${CLONED_REPOS[@]}"; do cloned_text+="  ✔ ${r}\n"; done
+else
+  cloned_text="  (none)\n"
+fi
+
+failed_text=""
+if [[ ${#FAILED_REPOS[@]} -gt 0 ]]; then
+  for r in "${FAILED_REPOS[@]}"; do failed_text+="  ✘ ${r}\n"; done
+fi
+
+summary_pango="<b>morganism bootstrap — complete</b>\n\n"
+summary_pango+="<b>Base path:</b>  ${BASE_PATH}\n"
+summary_pango+="<b>Log file:</b>   ${LOG}\n\n"
+summary_pango+="<b>Cloned successfully:</b>\n${cloned_text}"
+[[ -n "$failed_text" ]] && summary_pango+="\n<b>Failed to clone:</b>\n${failed_text}"
+summary_pango+="\n<b>Zenity:</b>  ${cleanup_str}\n"
+
+log "Summary — cloned  : ${CLONED_REPOS[*]:-none}"
+log "Summary — failed  : ${FAILED_REPOS[*]:-none}"
+log "Summary — zenity  : ${cleanup_str}"
+log "Bootstrap complete"
+
+# Prefer Zenity for summary; fall back to terminal if it was removed
+if command -v zenity &>/dev/null; then
+  zenity --info \
+    --title="morganism bootstrap — Done" \
+    --text="${summary_pango}" \
+    --width=500 \
+    2>/dev/null || true
+fi
+
+# Always print terminal summary too
+tty_print ""
+box "$GRN" "✔  Bootstrap complete" \
+  "" \
+  "  Base path : ${BASE_PATH}" \
+  "  Log file  : ${LOG}" \
+  "" \
+  "  Cloned    : ${CLONED_REPOS[*]:-none}" \
+  "  Failed    : ${FAILED_REPOS[*]:-none}" \
+  "  Zenity    : ${cleanup_str}" \
+  ""
+tty_print "  ${DIM}Full log → ${YLW}${LOG}${R}\n"
+
+exit 0
