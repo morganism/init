@@ -1,8 +1,0 @@
-#!/bin/bash 
-: <<DOCXX
-Description: Additions to .profile
-Author: me@morganism.dev
-Date: Sun 20 Sep 2020 18:34:15 BST
-DOCXX
-
-ls -1 profile.d/
